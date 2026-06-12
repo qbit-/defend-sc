@@ -51,3 +51,4 @@ The the figure lands at
   reported Eve is an oracle-candidate upper bound, not full-vocab reconstruction.
 - Train = SST-2 `train`, test = SST-2 `validation`; the denoiser, noise subspace,
   clip threshold, and task head are all fit on / derived from train (or frozen).
+- SIPIT paper's gradient-based SIPIT have not been evaluated
