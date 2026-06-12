@@ -106,13 +106,13 @@ def main():
     family_args = " ".join(args.families)
     print("\nNext commands:")
     print(
-        "conda run -n plumbbob python "
+        "python "
         "exps/split_sipit/sst2_logit/scripts/05_train_debiaser.py "
         f"--models {model_args} --ks {k_args} --sfs {sf_args} "
         f"--noise {family_args} --device cuda:0"
     )
     print(
-        "conda run -n plumbbob python "
+        "python "
         "exps/split_sipit/sst2_logit/scripts/12_setting_b1_channel.py "
         f"--models {model_args} --ks {k_args} --noise {family_args} "
         f"--sfs {sf_args} --distributions gaussian "

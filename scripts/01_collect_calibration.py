@@ -1,5 +1,4 @@
-"""Phase 1 SST-2: cache clean + clipped-clean cut activations and answer-position
-hidden states + labels. Sharded by (model, dataset, split_k)."""
+"""Phase 1 SST-2: cache clean + clipped-clean cut activations and answer-position hidden states + labels. Sharded by (model, dataset, split_k)."""
 from __future__ import annotations
 import os, sys, argparse
 from pathlib import Path

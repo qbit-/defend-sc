@@ -6,9 +6,6 @@ import random
 
 def set_seed(seed: int = 0, *, deterministic: bool = True) -> int:
     """Seed all RNGs and (optionally) pin deterministic GPU algorithms.
-
-    Call once, at the start of ``main()``, before models are loaded or any
-    CUDA work happens. Returns ``seed`` for convenience.
     """
     seed = int(seed)
     os.environ.setdefault("PYTHONHASHSEED", str(seed))

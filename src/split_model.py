@@ -64,12 +64,6 @@ def _hook_target(model, k: int):
 
 
 @torch.no_grad()
-def full_run(model, input_ids, attention_mask=None):
-    out = model(input_ids=input_ids, attention_mask=attention_mask)
-    return out.logits
-
-
-@torch.no_grad()
 def capture_a_k(model, input_ids, k: int, attention_mask=None) -> torch.Tensor:
     cap = _Capture()
     h = _hook_target(model, k).register_forward_pre_hook(cap.hook, with_kwargs=True)
@@ -111,47 +105,4 @@ def split_run(model, input_ids, k: int, hidden_override=None,
         "a_k": cap_ak.hidden,
         "server_out": cap_final.hidden,
         "logits": out.logits,
-    }
-
-
-def split_run_grad(model, input_ids, k: int, hidden_override=None,
-                   attention_mask=None) -> dict:
-    """Same as split_run but does NOT wrap in torch.no_grad(); keeps autograd.
-
-    Used by probe (4) backward-constructed noise to backprop through f_{k->L}.
-    Forward-pre-hooks on hidden_states are differentiable; only the no_grad decorator
-    on the original split_run prevents gradient flow.
-    """
-    cap_ak = _Capture()
-    cap_final = _Capture()
-    handles = []
-    target_k = _hook_target(model, k)
-    if hidden_override is None:
-        handles.append(target_k.register_forward_pre_hook(cap_ak.hook, with_kwargs=True))
-    else:
-        rep = _Replace(hidden_override)
-        handles.append(target_k.register_forward_pre_hook(rep.hook, with_kwargs=True))
-        handles.append(target_k.register_forward_pre_hook(cap_ak.hook, with_kwargs=True))
-    handles.append(M.final_norm(model).register_forward_pre_hook(cap_final.hook, with_kwargs=True))
-    try:
-        out = model(input_ids=input_ids, attention_mask=attention_mask)
-    finally:
-        for h in handles:
-            h.remove()
-    return {
-        "a_k": cap_ak.hidden,
-        "server_out": cap_final.hidden,
-        "logits": out.logits,
-    }
-
-
-@torch.no_grad()
-def verify_no_noise(model, input_ids, k: int, atol: float = 5e-3,
-                    attention_mask=None) -> dict:
-    ref = full_run(model, input_ids, attention_mask=attention_mask)
-    out = split_run(model, input_ids, k=k, attention_mask=attention_mask)
-    diff = (out["logits"].float() - ref.float()).abs().max().item()
-    return {
-        "k": k, "max_abs_diff": diff, "atol": atol, "passed": diff <= atol,
-        "ref_dtype": str(ref.dtype), "split_dtype": str(out["logits"].dtype),
     }

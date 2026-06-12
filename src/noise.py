@@ -105,11 +105,6 @@ class GaussianCov:
     def sample(self, shape, generator: torch.Generator, device, dtype=torch.float32,
                distribution: str = "gaussian"):
         """Sample iid noise. shape = (..., hidden).
-
-        Generator is always CPU for portability/determinism; tensor moved to device.
-        `distribution` controls the unit-variance factor z; the Sigma-shaped
-        linear transform is identical across distributions, so existing covariance
-        artifacts remain valid.
         """
         z0 = _sample_unit_variance(shape, distribution, generator,
                                    dtype=torch.float32)
@@ -146,9 +141,6 @@ class GaussianCov:
           - sigma0 == 0 with low-rank present (lowrank_struct family): Sigma is
             singular outside span(U). Perp directions are treated as
             infinite-precision and dropped from the maha distance.
-
-        Implementation delegates to `whiten_low_rank` so this code path stays
-        in sync with the autograd version used in `scripts/10_min_collision.py`.
         """
         if self.U is None or self.U.shape[1] == 0:
             return whiten_low_rank(x, self.sigma0, None, None)

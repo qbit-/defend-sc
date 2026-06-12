@@ -2,9 +2,6 @@
 # Reproduce the one-shot privacy/utility frontier diagram for the lowrank_struct
 # server-private suppressor (Qwen2.5-0.5B, SST-2, split k=8, rank 8).
 #
-# Source experiment: plumbbob/exps/split_sipit/sst2_logit, report
-# artifacts/reports/17_lowrank_private_suppressor_qwen_sst2.md
-#
 # Output plot: artifacts/plots/setting_g_qwen_sst2_lowrank_private_suppressor_exact_privacy_utility_frontier.png
 #
 # Requires a GPU + the project env (PyTorch, transformers). Set PY to its python.
