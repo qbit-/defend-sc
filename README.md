@@ -52,27 +52,6 @@ GPU + PyTorch, `transformers`, `numpy`, `matplotlib`. Validated against the
 project `formal-forge` env (PyTorch 2.x, transformers 4.57). Uses SDPA attention
 (no flash-attn). Only `gpt2` and `Qwen/Qwen2.5-0.5B` are wired in `src/models.py`.
 
-## Deliberate changes vs source (kept minimal)
-
-- **Restricted to the three frontier variants** (`clean_no_noise`,
-  `b1_lowrank_struct`, `b1_lowrank_struct_private_suppressor`). Everything the
-  source carried for other variants/families was dropped:
-  - `scripts/15_eval_tnsc.py`: removed the boundary-suppressor, logit-debiaser,
-    `unsafe_clean_reconstructor`, and `keyword`-task paths — deleting the unused
-    `src/debias.py` / `src/denoise.py` modules and the `boundary_path` /
-    `eve_boundary_*` / `rho_*` / `delta2_post_p95` CSV columns.
-  - `scripts/04_build_covariance.py` now builds **only** the `lowrank_struct`
-    covariance (was: isotropic / random-lowrank / fullrank-struct / diagonal too),
-    so `src/noise.py` keeps just `GaussianCov` and its samplers — the unused
-    `make_*` constructors, `LearnedCov`, and `build_phi` are gone.
-  - `scripts/14b_train_private_denoiser.py` + `src/private_denoise.py` keep only
-    `PrivateLowrankStructSuppressor`; the `PrivateGaussianWienerDenoiser` (and its
-    `prior_rank` plumbing) is removed.
-- **`scripts/04_build_covariance.py`**: added additive `--models/--ks/--ranks/--sfs`
-  CLI (defaults reproduce the original hardcoded gpt2+Qwen / k∈{0,4,8} / rank 16
-  behavior) so the **rank-8** base covariance the frontier needs can be built
-  without editing source.
-
 ## Notes on the evaluation (carried over from source)
 
 - Eve is teacher-forced on the true prefix and its candidate set always contains
