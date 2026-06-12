@@ -10,16 +10,6 @@ def run_id(tag: str) -> str:
     return f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{tag}"
 
 
-def env_hash() -> str:
-    try:
-        out = subprocess.check_output(
-            ["/root/miniconda3/bin/conda", "env", "export", "-n", "formal-forge"],
-            text=True, stderr=subprocess.DEVNULL, timeout=30)
-        return hashlib.sha256(out.encode()).hexdigest()[:16]
-    except Exception:
-        return "no-env"
-
-
 def gpu_info() -> dict:
     try:
         import torch
@@ -54,7 +44,6 @@ def base_meta(script_name: str, **extra) -> dict:
         "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "git_commit": git_commit(),
         "script_name": script_name,
-        "env_hash": env_hash(),
         "gpu": gpu_info(),
         **extra,
     }
