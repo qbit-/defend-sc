@@ -13,7 +13,8 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-os.environ.setdefault("HF_HOME", "/root/autodl-tmp/claude-hf-cache")
+os.environ.setdefault("HF_HOME", str(ROOT / ".hf_cache"))
+os.environ.setdefault("HF_HUB_CACHE", str(Path(os.environ["HF_HOME"]) / "hub"))
 
 from src import util
 from src import seeding

@@ -1,9 +1,34 @@
 """SST-2 data loading + verbalizer + label-token resolution."""
 from __future__ import annotations
 from dataclasses import dataclass
+import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _cache_writable(path: str) -> bool:
+    p = Path(path).expanduser()
+    try:
+        if p.exists():
+            return os.access(p, os.W_OK)
+        parent = p
+        while not parent.exists() and parent != parent.parent:
+            parent = parent.parent
+        return os.access(parent, os.W_OK)
+    except OSError:
+        return False
+
+
+if not os.environ.get("HF_HOME") or not _cache_writable(os.environ["HF_HOME"]):
+    os.environ["HF_HOME"] = str(ROOT / ".hf_cache")
+if not os.environ.get("HF_HUB_CACHE") or not _cache_writable(os.environ["HF_HUB_CACHE"]):
+    os.environ["HF_HUB_CACHE"] = str(Path(os.environ["HF_HOME"]) / "hub")
+if not os.environ.get("TRANSFORMERS_CACHE") or not _cache_writable(os.environ["TRANSFORMERS_CACHE"]):
+    os.environ["TRANSFORMERS_CACHE"] = os.environ["HF_HUB_CACHE"]
+
 import torch
 from datasets import load_dataset
-
 
 PROMPT_TEMPLATE = "Review: {sentence}\nSentiment:"
 

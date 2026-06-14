@@ -25,8 +25,34 @@ export PYTHONHASHSEED="$SEED"
 
 cd "$(dirname "$0")"
 
+# Keep Hugging Face downloads in a writable project-local cache unless the user
+# has already configured a writable cache location.
+cache_writable() {
+    local path="$1"
+    local parent="$path"
+    if [[ -e "$path" ]]; then
+        [[ -w "$path" ]]
+        return
+    fi
+    while [[ ! -e "$parent" && "$parent" != "/" ]]; do
+        parent="$(dirname "$parent")"
+    done
+    [[ -w "$parent" ]]
+}
+
+DEFAULT_HF_HOME="$PWD/.hf_cache"
+if [[ -z "${HF_HOME:-}" ]] || ! cache_writable "$HF_HOME"; then
+    export HF_HOME="$DEFAULT_HF_HOME"
+fi
+if [[ -z "${HF_HUB_CACHE:-}" ]] || ! cache_writable "$HF_HUB_CACHE"; then
+    export HF_HUB_CACHE="$HF_HOME/hub"
+fi
+if [[ -z "${TRANSFORMERS_CACHE:-}" ]] || ! cache_writable "$TRANSFORMERS_CACHE"; then
+    export TRANSFORMERS_CACHE="$HF_HUB_CACHE"
+fi
+
 # Scaffolding dirs the source scripts assume exist (committed in the original repo).
-mkdir -p artifacts/reports artifacts/plots
+mkdir -p artifacts/reports artifacts/plots "$HF_HOME" "$HF_HUB_CACHE"
 
 # 1. Cache clean + clipped cut activations, answer-position features, task head (LM-head rows).
 $PY scripts/01_collect_calibration.py --device "$DEVICE" --models "$MODEL" --ks $K --seed "$SEED"
