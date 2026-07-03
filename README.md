@@ -1,14 +1,13 @@
-# Prelim experimental code for securing activation channel
+# Experimental code for securing activation channel against SIPIT attack
 
-Preliminary experimental code to produce the **privacy / utility
-frontier** diagram on Qwen2.5-0.5B / SST-2.
+Experimental code to produce the **privacy / utility
+frontier** diagram on Qwen2.5-0.5B on the SST-2 benchmark\.
 
 ## What the frontier shows
 
 `exact Eve token top-1` (x, teacher-forced attacker recovery under the known noise covariance)
 vs `SST-2 accuracy` (y), one point per noise scale, for two channels:
-the raw noisy channel and the server-private-suppressed channel. At some regions, the suppressor
-can recover some task utility while exact Eve stays low. 
+the raw noisy channel and the server-private-suppressed channel. At some regions, the suppressor can recover some task utility while exact Eve stays low. 
 
 ## Layout
 
@@ -46,9 +45,6 @@ The the figure lands at
 
 ## Notes on the evaluation
 
-- Eve is teacher-forced on the true prefix and its candidate set always contains
-  the ground-truth token (~101 candidates: top-80 + 20 random + truth), so the
-  reported Eve is an oracle-candidate upper bound, not full-vocab reconstruction.
-- Train = SST-2 `train`, test = SST-2 `validation`; the denoiser, noise subspace,
-  clip threshold, and task head are all fit on / derived from train (or frozen).
-- SIPIT paper's gradient-based SIPIT have not been evaluated
+- Eve is teacher-forced on the true prefix and its candidate set always contains the ground-truth token (~101 candidates: top-80 + 20 random + truth), so the reported Eve success rate is an oracle-candidate upper bound, not full-vocab reconstruction.
+- Train = SST-2 `train`, test = SST-2 `validation`; the denoiser, noise subspace, clip threshold, and task head are all fit on / derived from train (or frozen).
+- SIPIT paper's gradient-based SIPIT method have not been evaluated
