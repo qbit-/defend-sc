@@ -24,6 +24,8 @@ scripts/                 # 7-stage pipeline (run in order; see run_frontier.sh)
 run_frontier.sh          # end-to-end driver
 ```
 
+Find a detailed overview of the code and the method in [Overview](./docs/OVERVIEW.md)
+
 ## Pipeline (each stage writes under `./artifacts/`)
 
 1. `01_collect_calibration.py`: activation cache (train/test clean+clipped), `task_weights` (frozen LM-head rows) 
@@ -40,8 +42,8 @@ Run it all:
 PY=/path/to/env/python DEVICE=cuda:0 ./run_frontier.sh
 ```
 
-The the figure lands at
-`artifacts/plots/setting_g_qwen_sst2_lowrank_private_suppressor_exact_privacy_utility_frontier.png`.
+The figures land at
+`artifacts/plots/`.
 
 ## Notes on the evaluation
 
