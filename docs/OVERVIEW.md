@@ -3,6 +3,8 @@
 ## Summary
 
 We consider a scenario in which an attacker can intercept data in the transmission channel or on the server before it enters the protected part of the model. We assume that once the data has entered this part of the model, it is no longer available to the attacker. The defense is for the client to transmit noised activations, while the server applies private noise suppression inside the network. This setting is described in the [preliminaries](#1-preliminaries) and in the [experiment idea](#2-idea-and-experiment). We build the experiment idea on our previous work on LLM robustness [ICML2026](https://icml.cc/virtual/2026/poster/66057).
+The code to reproduce experiments can be found at [Github](https://github.com/qbit-/defend-sc.git).
+
 
 The main result is shown in the [Pareto plot](artifacts/plots/setting_g_qwen_sst2_lowrank_private_suppressor_exact_privacy_utility_frontier.png): the horizontal axis shows the success rate of [SIPIT](https://github.com/giorgosnikolaou/SIPIT), meaning the frequency of successful token reconstruction, while the vertical axis shows downstream task accuracy. Noise reduces attack success, but it also degrades model quality. Without adaptation, the server side quickly loses accuracy; after applying the private suppressor, part of that quality can be recovered. We did not run a broad optimization sweep or try to maximize performance: in this proof-of-principle experiment, only the server-side input was adapted.
 
