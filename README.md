@@ -45,6 +45,37 @@ PY=/path/to/env/python DEVICE=cuda:0 ./run_frontier.sh
 The figures land at
 `artifacts/plots/`.
 
+## Exporting Markdown documents to PDF
+
+On a SageMaker Ubuntu notebook, install XeLaTeX and fonts
+(Pandoc is typically already present):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  texlive-xetex \
+  texlive-fonts-recommended \
+  texlive-lang-cyrillic \
+  lmodern \
+  fonts-dejavu
+```
+
+Run Pandoc:
+
+```bash
+pandoc docs/OVERVIEW_full_rus.md \
+  -o OVERVIEW_full_rus.pdf \
+  --pdf-engine=xelatex \
+  -V lang=ru \   # For Russian texts, drop this for English
+  -V mainfont="DejaVu Serif" \
+  -V sansfont="DejaVu Sans" \
+  -V monofont="DejaVu Sans Mono" \
+  -V geometry:margin=1in \
+  --resource-path=.:docs
+```
+
+`--resource-path` lets relative plot links resolve.
+
 ## Notes on the evaluation
 
 - Eve is teacher-forced on the true prefix and its candidate set always contains the ground-truth token (~101 candidates: top-80 + 20 random + truth), so the reported Eve success rate is an oracle-candidate upper bound, not full-vocab reconstruction.
