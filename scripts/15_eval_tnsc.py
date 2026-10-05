@@ -3,7 +3,7 @@ from __future__ import annotations
 import os, sys, argparse, json, csv
 from pathlib import Path
 import math
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
 import torch
 
@@ -436,82 +436,375 @@ def utility_metrics(model, k: int, cache: dict, task_weights, task_bias, label_t
     }
 
 
-@torch.no_grad()
-def attack_metrics(model, model_id: str, k: int, cache: dict, cov: N.GaussianCov | None,
-                   repeats: tuple[int, ...],
-                   n_attack_prompts: int, positions: tuple[int, ...],
-                   seed: int, device, dtype, attack_split: str = "test",
-                   task: str = "sst2") -> list[dict]:
-    attack_cache = cache[attack_split]
-    ids = attack_cache["ids"][:n_attack_prompts]
-    mask = attack_cache.get("privacy_mask", attack_cache["mask"])[:n_attack_prompts]
-    clipped_a = attack_cache["clipped_a"][:n_attack_prompts]
-    clouds = build_or_load_clouds(
-        model, model_id, k, ids, positions, top_k=80,
-        n_rand=20, chunk=M.cloud_chunk_size(model), device=device,
-        task=task,
+def _attack_clouds(
+    model: Any,
+    model_id: str,
+    k: int,
+    ids: torch.Tensor,
+    positions: tuple[int, ...],
+    device: str,
+    task: str,
+    independent_recovery: bool,
+) -> dict | None:
+    """Return true-prefix clouds, or none for sequential recovery.
+
+    Args:
+        model: Causal language model.
+        model_id: Checkpoint id.
+        k: Split depth.
+        ids: Prompt tokens.
+        positions: Attack indices.
+        device: Torch device.
+        task: Benchmark name.
+        independent_recovery: Build clouds only when this is true.
+
+    Returns:
+        Cloud cache, or ``None`` when guesses are fed back.
+    """
+    if not independent_recovery:
+        return None
+    return build_or_load_clouds(
+        model, model_id, k, ids, positions, top_k=80, n_rand=20,
+        chunk=M.cloud_chunk_size(model), device=device, task=task,
     )
 
+
+def _run_attack(
+    model: Any,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    observed: torch.Tensor,
+    k: int,
+    positions: tuple[int, ...],
+    clouds: dict | None,
+    cov: N.GaussianCov | None,
+    prior_weight: float,
+    score_fn: Callable[..., torch.Tensor] | None,
+    independent_recovery: bool,
+) -> dict:
+    """Run one SIPIT variant on its own recovered prompt.
+
+    Args:
+        model: Causal language model.
+        ids: True prompt tokens.
+        mask: Privacy mask.
+        observed: Cut activations Eve sees.
+        k: Split depth.
+        positions: Indices to recover.
+        clouds: True-prefix clouds, or ``None``.
+        cov: Optional Mahalanobis covariance.
+        prior_weight: Log-prior mixture weight.
+        score_fn: Optional custom candidate scorer.
+        independent_recovery: Use the true prefix at every position.
+
+    Returns:
+        SIPIT metric dict.
+    """
+    extra: dict = {}
+    if not independent_recovery:
+        extra = {
+            "top_k": 80,
+            "n_rand": 20,
+            "chunk": M.cloud_chunk_size(model),
+        }
+    return SIP.attack_positions(
+        model, ids, mask, observed, k=k, positions=positions,
+        cov=cov, prior_weight=prior_weight, clouds=clouds,
+        score_fn=score_fn, independent_recovery=independent_recovery,
+        **extra,
+    )
+
+
+def _exact_score(
+    cloud: torch.Tensor, obs: torch.Tensor, cov: N.GaussianCov,
+) -> torch.Tensor:
+    """Score candidates by the Gaussian residual likelihood.
+
+    Args:
+        cloud: Candidate cut states, ``[B, V', H]``.
+        obs: Observed cut state, ``[B, H]``.
+        cov: Noise covariance.
+
+    Returns:
+        Higher-is-better scores, ``[B, V']``.
+    """
+    residual = cloud - obs.unsqueeze(1)
+    return ED.score_diff_exact(residual, cov, "gaussian")
+
+
+class _ExactScore:
+    """Gaussian exact attacker bound to one covariance."""
+
+    def __init__(self, cov: N.GaussianCov) -> None:
+        """Store the covariance for this observation.
+
+        Args:
+            cov: Noise covariance on the attack device.
+        """
+        self.cov = cov
+
+    def __call__(
+        self, cloud: torch.Tensor, obs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score one candidate cloud.
+
+        Args:
+            cloud: Candidate cut states, ``[B, V', H]``.
+            obs: Observed cut state, ``[B, H]``.
+
+        Returns:
+            Higher-is-better scores, ``[B, V']``.
+        """
+        return _exact_score(cloud, obs, self.cov)
+
+
+def _clean_attack_row(clean: dict) -> dict:
+    """Build the clean-reference attack row.
+
+    Args:
+        clean: Metrics from the noiseless attacker.
+
+    Returns:
+        One CSV-ready metrics dict.
+    """
+    success, total = accuracy_counts(
+        clean["token_top1"], clean["n_eval"],
+    )
+    low, high = wilson_ci(success, total)
+    rate = clean["token_top1"]
+    return {
+        "repeats": 1,
+        "repeat_policy": "clean_reference",
+        "eve_clean_baseline": rate,
+        "eve_vanilla": rate,
+        "eve_seq_map": rate,
+        "eve_raw_exact": rate,
+        "eve_best_attacker": rate,
+        "eve_n_eval": clean["n_eval"],
+        "wilson_ci_low": low,
+        "wilson_ci_high": high,
+    }
+
+
+def _eve_row(
+    repeat: int,
+    policy: str,
+    clean_rate: float,
+    vanilla: float,
+    sequence: float,
+    exact_rate: float,
+    n_eval: int,
+    ci_low: float,
+    ci_high: float,
+) -> dict:
+    """Build one noisy-attacker metrics row.
+
+    Args:
+        repeat: Repeat count.
+        policy: Repeat policy name.
+        clean_rate: Clean-reference top-1.
+        vanilla: Vanilla attacker top-1.
+        sequence: Sequence-MAP top-1.
+        exact_rate: Exact attacker top-1.
+        n_eval: Number of scored tokens.
+        ci_low: Wilson interval lower bound.
+        ci_high: Wilson interval upper bound.
+
+    Returns:
+        One CSV-ready metrics dict.
+    """
+    return {
+        "repeats": int(repeat),
+        "repeat_policy": policy,
+        "eve_clean_baseline": clean_rate,
+        "eve_vanilla": vanilla,
+        "eve_seq_map": sequence,
+        "eve_raw_exact": exact_rate,
+        "eve_best_attacker": max(vanilla, sequence, exact_rate),
+        "eve_n_eval": n_eval,
+        "wilson_ci_low": ci_low,
+        "wilson_ci_high": ci_high,
+    }
+
+
+def _policy_row(
+    model: Any,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    realizations: list[torch.Tensor],
+    cov: N.GaussianCov,
+    clouds: dict | None,
+    positions: tuple[int, ...],
+    device: str,
+    dtype: torch.dtype,
+    k: int,
+    clean: dict,
+    repeat: int,
+    policy: str,
+    independent_recovery: bool,
+) -> dict:
+    """Score one repeat policy with three attackers.
+
+    Args:
+        model: Causal language model.
+        ids: True tokens on device.
+        mask: Privacy mask on device.
+        realizations: Noise realizations of the cut.
+        cov: Noise covariance.
+        clouds: True-prefix clouds, or ``None``.
+        positions: Attack indices.
+        device: Torch device.
+        dtype: Activation dtype.
+        k: Split depth.
+        clean: Clean-reference metrics.
+        repeat: Repeat count.
+        policy: Repeat policy name.
+        independent_recovery: Use the true prefix when true.
+
+    Returns:
+        One CSV-ready metrics dict.
+    """
+    observed = observation_for_policy(
+        realizations, policy, int(repeat),
+    ).to(device, dtype)
+    cov_eff = effective_cov_for_policy(cov, policy, int(repeat))
+    cov_dev = cov_eff.to(device, dtype)
+    shared = (model, ids, mask, observed, k, positions, clouds)
+    vanilla = _run_attack(
+        *shared, None, 0.0, None, independent_recovery,
+    )
+    sequence = _run_attack(
+        *shared, cov_dev, 1.0, None, independent_recovery,
+    )
+    exact = _run_attack(
+        *shared, None, 0.0, _ExactScore(cov_dev),
+        independent_recovery,
+    )
+    successes, total = accuracy_counts(
+        exact["token_top1"], exact["n_eval"],
+    )
+    ci_low, ci_high = wilson_ci(successes, total)
+    return _eve_row(
+        int(repeat), policy, clean["token_top1"],
+        vanilla["token_top1"], sequence["token_top1"],
+        exact["token_top1"], exact["n_eval"], ci_low, ci_high,
+    )
+
+
+def _noisy_attack_rows(
+    model: Any,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    clipped_a: torch.Tensor,
+    cov: N.GaussianCov,
+    clouds: dict | None,
+    repeats: tuple[int, ...],
+    positions: tuple[int, ...],
+    seed: int,
+    device: str,
+    dtype: torch.dtype,
+    k: int,
+    clean: dict,
+    independent_recovery: bool,
+) -> list[dict]:
+    """Score vanilla, sequence-MAP, and exact attackers.
+
+    Each attacker keeps its own recovered prompt.
+
+    Args:
+        model: Causal language model.
+        ids: True tokens on device.
+        mask: Privacy mask on device.
+        clipped_a: Clean cut activations.
+        cov: Noise covariance.
+        clouds: True-prefix clouds, or ``None``.
+        repeats: Repeat counts.
+        positions: Attack indices.
+        seed: Noise seed.
+        device: Torch device.
+        dtype: Activation dtype.
+        k: Split depth.
+        clean: Clean-reference metrics.
+        independent_recovery: Use the true prefix when true.
+
+    Returns:
+        One row per repeat count and policy.
+    """
+    k_max = max(max(repeats), 1)
+    realizations = materialize_realizations(
+        clipped_a, cov, K=k_max, base_seed=seed, dtype=dtype,
+    )
+    out_rows = []
+    for repeat in repeats:
+        for policy in REPEAT_POLICIES:
+            out_rows.append(_policy_row(
+                model, ids, mask, realizations, cov, clouds,
+                positions, device, dtype, k, clean, int(repeat),
+                policy, independent_recovery,
+            ))
+    return out_rows
+
+
+@torch.no_grad()
+def attack_metrics(
+    model: Any,
+    model_id: str,
+    k: int,
+    cache: dict,
+    cov: N.GaussianCov | None,
+    repeats: tuple[int, ...],
+    n_attack_prompts: int,
+    positions: tuple[int, ...],
+    seed: int,
+    device: str,
+    dtype: torch.dtype,
+    attack_split: str = "test",
+    task: str = "sst2",
+    independent_recovery: bool = True,
+) -> list[dict]:
+    """Score Eve from the true prefix or from each attacker's guesses.
+
+    Args:
+        model: Causal language model.
+        model_id: Checkpoint id.
+        k: Split depth.
+        cache: Activation cache for both splits.
+        cov: Noise covariance, or ``None`` for the clean reference.
+        repeats: Repeat counts.
+        n_attack_prompts: How many prompts to attack.
+        positions: Token indices to recover.
+        seed: Noise seed.
+        device: Torch device.
+        dtype: Activation dtype.
+        attack_split: ``train`` or ``test``.
+        task: Benchmark name.
+        independent_recovery: Keep the true prefix when true.
+
+    Returns:
+        Metric rows for the clean run or each noisy policy.
+    """
+    attack_cache = cache[attack_split]
+    ids = attack_cache["ids"][:n_attack_prompts]
+    mask = attack_cache.get(
+        "privacy_mask", attack_cache["mask"],
+    )[:n_attack_prompts]
+    clipped = attack_cache["clipped_a"][:n_attack_prompts]
+    clouds = _attack_clouds(
+        model, model_id, k, ids, positions, device, task,
+        independent_recovery,
+    )
     ids_dev = ids.to(device)
     mask_dev = mask.to(device)
-    clean = SIP.attack_positions(model, ids_dev, mask_dev, clipped_a.to(device, dtype),
-                                 k=k, positions=positions, cov=None, prior_weight=0.0,
-                                 clouds=clouds)
-    clean_success, clean_total = accuracy_counts(clean["token_top1"], clean["n_eval"])
-    clean_ci = wilson_ci(clean_success, clean_total)
-
+    clean = _run_attack(
+        model, ids_dev, mask_dev, clipped.to(device, dtype),
+        k, positions, clouds, None, 0.0, None, independent_recovery,
+    )
     if cov is None:
-        return [{
-            "repeats": 1,
-            "repeat_policy": "clean_reference",
-            "eve_clean_baseline": clean["token_top1"],
-            "eve_vanilla": clean["token_top1"],
-            "eve_seq_map": clean["token_top1"],
-            "eve_raw_exact": clean["token_top1"],
-            "eve_best_attacker": clean["token_top1"],
-            "eve_n_eval": clean["n_eval"],
-            "wilson_ci_low": clean_ci[0],
-            "wilson_ci_high": clean_ci[1],
-        }]
-
-    K_max = max(max(repeats), 1)
-    realizations = materialize_realizations(clipped_a, cov, K=K_max, base_seed=seed, dtype=dtype)
-    out_rows = []
-    for m in repeats:
-        for policy in REPEAT_POLICIES:
-            a_bar = observation_for_policy(realizations, policy, int(m)).to(device, dtype)
-            cov_eff = effective_cov_for_policy(cov, policy, int(m))
-            cov_eff_dev = cov_eff.to(device, dtype)
-            van = SIP.attack_positions(model, ids_dev, mask_dev, a_bar, k=k,
-                                       positions=positions, cov=None, prior_weight=0.0,
-                                       clouds=clouds)
-            seq = SIP.attack_positions(model, ids_dev, mask_dev, a_bar, k=k,
-                                       positions=positions, cov=cov_eff, prior_weight=1.0,
-                                       clouds=clouds)
-
-            def exact_score(cloud, obs):
-                return ED.score_diff_exact(cloud - obs.unsqueeze(1), cov_eff_dev, "gaussian")
-
-            exact = SIP.attack_positions(model, ids_dev, mask_dev, a_bar, k=k,
-                                         positions=positions, cov=None, prior_weight=0.0,
-                                         clouds=clouds, score_fn=exact_score)
-
-            successes, total = accuracy_counts(exact["token_top1"], exact["n_eval"])
-            ci_low, ci_high = wilson_ci(successes, total)
-            vals = [van["token_top1"], seq["token_top1"], exact["token_top1"]]
-            out_rows.append({
-                "repeats": int(m),
-                "repeat_policy": policy,
-                "eve_clean_baseline": clean["token_top1"],
-                "eve_vanilla": van["token_top1"],
-                "eve_seq_map": seq["token_top1"],
-                "eve_raw_exact": exact["token_top1"],
-                "eve_best_attacker": max(vals),
-                "eve_n_eval": exact["n_eval"],
-                "wilson_ci_low": ci_low,
-                "wilson_ci_high": ci_high,
-            })
-    return out_rows
+        return [_clean_attack_row(clean)]
+    return _noisy_attack_rows(
+        model, ids_dev, mask_dev, clipped, cov, clouds, repeats,
+        positions, seed, device, dtype, k, clean, independent_recovery,
+    )
 
 
 def make_skip_row(meta: dict, reason: str) -> dict:
@@ -563,6 +856,28 @@ def blank_utility_metrics() -> dict:
     }
 
 
+def _parse_bool(text: str) -> bool:
+    """Parse a CLI boolean.
+
+    Args:
+        text: ``1``/``0``, ``true``/``false``, or ``yes``/``no``.
+
+    Returns:
+        Parsed boolean.
+
+    Raises:
+        argparse.ArgumentTypeError: If ``text`` is not a boolean.
+    """
+    lowered = text.strip().lower()
+    if lowered in {"1", "true", "yes", "y"}:
+        return True
+    if lowered in {"0", "false", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"expected a boolean, got {text!r}",
+    )
+
+
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cuda:0")
@@ -575,6 +890,15 @@ def parse_args():
     ap.add_argument("--attack-split", default="test", choices=["train", "test"],
                     help="cache split used for Eve/SIPIT attack metrics")
     ap.add_argument("--positions", nargs="+", type=int, default=None)
+    ap.add_argument(
+        "--independent_recovery",
+        type=_parse_bool,
+        default=True,
+        help=(
+            "1/true scores each position from the true prefix. "
+            "0/false feeds each guess into the recovered prompt."
+        ),
+    )
     ap.add_argument("--seeds", nargs="+", type=int, default=[0])
     ap.add_argument("--K", type=int, default=1)
     ap.add_argument("--repeats", nargs="+", type=int, default=list(DEFAULT_REPEATS))
@@ -718,6 +1042,7 @@ def main():
         n_attack_prompts=args.n_attack_prompts,
         attack_split=args.attack_split,
         positions=args.positions,
+        independent_recovery=args.independent_recovery,
         seeds=args.seeds,
         K=args.K,
         repeats=args.repeats,
@@ -845,7 +1170,11 @@ def main():
                                 seed=seed + 777_000 + 1000 * k,
                                 device=args.device, dtype=dtype,
                                 attack_split=args.attack_split,
-                                task=args.task)
+                                task=args.task,
+                                independent_recovery=(
+                                    args.independent_recovery
+                                ),
+                            )
                             for arow in attack_rows:
                                 row = {
                                     **meta,
