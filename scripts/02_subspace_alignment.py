@@ -23,7 +23,7 @@ def per_prompt_local_S(model, ids, prefix_lens, k, n_top=80, n_rand=20,
     """Vocabulary-wide candidate clouds at intermediate prefix positions, same as
     tame_sipit Phase 2 (S is the *prompt-recovery* subspace, not label-discriminative)."""
     out = []
-    vocab = model.config.vocab_size
+    vocab = M.vocab_size(model)
     B = ids.shape[0]
     for t in prefix_lens:
         if t >= ids.shape[1]:
@@ -31,8 +31,10 @@ def per_prompt_local_S(model, ids, prefix_lens, k, n_top=80, n_rand=20,
         top = CS.topk_candidates(model, ids, position=t, k_top=n_top)
         rand = CS.random_candidates(vocab, B, n_rand, seed=12345 + t).to(ids.device)
         cand = torch.cat([top, rand], dim=1)
-        cloud = CS.candidate_cloud(model, ids, position=t, candidate_ids=cand,
-                                   k_split=k, chunk_size=256)
+        cloud = CS.candidate_cloud(
+            model, ids, position=t, candidate_ids=cand,
+            k_split=k, chunk_size=M.cloud_chunk_size(model),
+        )
         for b in range(cloud.shape[0]):
             U, S, r = CS.local_subspace(cloud[b], energy=energy, max_rank=max_rank)
             if r > 0:
@@ -136,12 +138,8 @@ def main():
     seeding.set_seed(args.seed)
 
     rows = []
-    dtype_by_model = {
-        "gpt2": torch.float32,
-        "Qwen/Qwen2.5-0.5B": torch.float32,
-    }
     for mid in args.models:
-        dt = dtype_by_model.get(mid, torch.float32)
+        dt = M.default_dtype(mid, args.device)
         for k in args.ks:
             r = run_alignment(mid, k, n_prompts=args.n_prompts,
                               prefix_lens=tuple(args.prefix_lens),

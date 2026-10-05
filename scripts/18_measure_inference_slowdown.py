@@ -1,4 +1,9 @@
-"""Measure inference slowdown from low-rank noise and suppression."""
+"""Measure inference slowdown from low-rank noise and suppression.
+
+Head and tail times come from one model forward. A pre-hook at the
+split records when the cut activation is reached. The same path works
+for Qwen2.5 and Qwen3.5.
+"""
 from __future__ import annotations
 
 import argparse
@@ -16,8 +21,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.qwen2 import modeling_qwen2
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -33,6 +36,7 @@ try:
 except Exception:
     pass
 
+from src import models as M
 from src import sst2_data as D
 from src import util
 
@@ -42,11 +46,16 @@ DEFAULT_MODELS = (
     "Qwen/Qwen2.5-1.5B",
     "Qwen/Qwen2.5-3B",
     "Qwen/Qwen2.5-7B",
+    "Qwen/Qwen3.5-4B",
 )
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
+    """Parse command-line arguments.
+
+    Returns:
+        Parsed arguments.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS))
     ap.add_argument("--device", default="cuda:0")
@@ -58,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--split-k", type=int, default=8)
     ap.add_argument("--rank", type=int, default=8)
     ap.add_argument("--n-prompts", type=int, default=256)
-    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--batch-size", type=int, default=M.DEFAULT_BATCH)
     ap.add_argument("--max-len", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--warmup-iters", type=int, default=2)
@@ -79,27 +88,38 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_dtype(name: str, device: str) -> torch.dtype:
-    """Resolve a dtype name into a torch dtype."""
-    if name == "float32":
-        return torch.float32
+    """Resolve a dtype name into a torch dtype.
+
+    Args:
+        name: ``auto``, ``float32``, ``float16``, or ``bfloat16``.
+        device: Torch device string.
+
+    Returns:
+        Torch dtype. ``auto`` follows ``default_dtype``.
+    """
     if name == "float16":
         return torch.float16
     if name == "bfloat16":
         return torch.bfloat16
-    if device.startswith("cuda") and torch.cuda.is_available():
-        if torch.cuda.is_bf16_supported():
-            return torch.bfloat16
-        return torch.float16
+    if name == "auto":
+        return M.default_dtype("", device)
     return torch.float32
 
 
 def model_label(model_id: str) -> str:
-    """Return a compact label for a Qwen model id."""
-    return model_id.rsplit("/", maxsplit=1)[-1].replace("Qwen2.5-", "")
+    """Return a short label for a model id.
+
+    Args:
+        model_id: Hugging Face model id.
+
+    Returns:
+        Repository name without the organization.
+    """
+    return model_id.rsplit("/", maxsplit=1)[-1]
 
 
 def load_batches(
-    tokenizer: AutoTokenizer,
+    tokenizer: Any,
     n_prompts: int,
     max_len: int,
     batch_size: int,
@@ -107,7 +127,20 @@ def load_batches(
     seed: int,
     max_batches: int,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Load SST-2 validation prompts and return device batches."""
+    """Load SST-2 validation prompts and return device batches.
+
+    Args:
+        tokenizer: Tokenizer used to encode prompts.
+        n_prompts: Number of validation prompts.
+        max_len: Maximum token length.
+        batch_size: Prompts per forward.
+        device: Torch device string.
+        seed: Shuffle seed.
+        max_batches: Cap on batches. ``0`` keeps all batches.
+
+    Returns:
+        List of ``(input_ids, attention_mask)`` batches.
+    """
     examples = D.load_sst2(split="validation", n=n_prompts, seed=seed)
     ids, mask, _ = D.encode_prompts(
         tokenizer,
@@ -124,107 +157,147 @@ def load_batches(
     return batches
 
 
-def qwen_context(
-    qwen_model: Any,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-    """Create Qwen hidden states, positions, rotary embeddings, and masks."""
-    hidden_states = qwen_model.embed_tokens(input_ids)
-    cache_position = torch.arange(
-        hidden_states.shape[1],
-        device=hidden_states.device,
-    )
-    position_ids = cache_position.unsqueeze(0)
-    mask_kwargs = {
-        "config": qwen_model.config,
-        "input_embeds": hidden_states,
-        "attention_mask": attention_mask,
-        "cache_position": cache_position,
-        "past_key_values": None,
-        "position_ids": position_ids,
-    }
-    causal_masks = {
-        "full_attention": modeling_qwen2.create_causal_mask(**mask_kwargs),
-    }
-    if getattr(qwen_model, "has_sliding_layers", False):
-        causal_masks["sliding_attention"] = (
-            modeling_qwen2.create_sliding_window_causal_mask(**mask_kwargs)
-        )
-    position_embeddings = qwen_model.rotary_emb(hidden_states, position_ids)
-    return hidden_states, position_ids, cache_position, {
-        "causal_masks": causal_masks,
-        "position_embeddings": position_embeddings,
-    }
+def cut_module(model: torch.nn.Module, split_k: int) -> torch.nn.Module:
+    """Return the module whose input is the cut activation.
+
+    Args:
+        model: Loaded model.
+        split_k: Split depth, from 0 through the layer count.
+
+    Returns:
+        Decoder block ``split_k``, or the final norm at the last cut.
+    """
+    n_layers = M.n_layers(model)
+    if not 0 <= split_k <= n_layers:
+        raise ValueError(f"split_k={split_k} is outside 0..{n_layers}")
+    if split_k < n_layers:
+        return M.get_blocks(model)[split_k]
+    return M.final_norm(model)
 
 
-def run_qwen_layers(
-    layers: Any,
-    hidden_states: torch.Tensor,
-    position_ids: torch.Tensor,
-    cache_position: torch.Tensor,
-    causal_masks: dict,
-    position_embeddings: tuple[torch.Tensor, torch.Tensor],
-) -> torch.Tensor:
-    """Run a sequence of Qwen decoder layers."""
-    for layer in layers:
-        hidden_states = layer(
-            hidden_states,
-            attention_mask=causal_masks[layer.attention_type],
-            position_ids=position_ids,
-            past_key_values=None,
-            use_cache=False,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-        )
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
-    return hidden_states
+def sync_if_needed(device: str) -> None:
+    """Synchronize CUDA timing when the device is CUDA.
+
+    Args:
+        device: Torch device string.
+    """
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
-def qwen_head(
-    model: Any,
+def _hidden_from_call(args: tuple, kwargs: dict) -> torch.Tensor:
+    """Return the hidden state passed into a hooked module.
+
+    Args:
+        args: Positional arguments from the pre-hook.
+        kwargs: Keyword arguments from the pre-hook.
+
+    Returns:
+        Hidden-state tensor.
+    """
+    if args and isinstance(args[0], torch.Tensor):
+        return args[0]
+    return kwargs["hidden_states"]
+
+
+def time_one_forward(
+    model: torch.nn.Module,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     split_k: int,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, dict]]:
-    """Run Qwen embeddings and layers before the split."""
-    qwen_model = model.model
-    hidden, position_ids, cache_position, extra = qwen_context(
-        qwen_model,
-        input_ids,
-        attention_mask,
-    )
-    hidden = run_qwen_layers(
-        qwen_model.layers[:split_k],
-        hidden,
-        position_ids,
-        cache_position,
-        extra["causal_masks"],
-        extra["position_embeddings"],
-    )
-    return hidden, (position_ids, cache_position, extra)
+    device: str,
+) -> tuple[float, float, torch.Tensor]:
+    """Time one forward up to the split and after it.
+
+    Args:
+        model: Eval-mode model.
+        input_ids: Token ids for one batch.
+        attention_mask: Attention mask for that batch.
+        split_k: Decoder depth where noise is injected.
+        device: Torch device string.
+
+    Returns:
+        Head seconds, tail seconds, and the cut activation.
+    """
+    captured: dict[str, Any] = {}
+
+    def hook(
+        module: torch.nn.Module,
+        args: tuple,
+        kwargs: dict,
+    ) -> None:
+        sync_if_needed(device)
+        captured["t"] = time.perf_counter()
+        hidden = _hidden_from_call(args, kwargs)
+        captured["h"] = hidden.detach().clone()
+
+    target = cut_module(model, split_k)
+    handle = target.register_forward_pre_hook(hook, with_kwargs=True)
+    sync_if_needed(device)
+    start = time.perf_counter()
+    try:
+        model(input_ids=input_ids, attention_mask=attention_mask)
+    finally:
+        handle.remove()
+    sync_if_needed(device)
+    end = time.perf_counter()
+    if "t" not in captured or "h" not in captured:
+        raise RuntimeError(f"split hook did not run at k={split_k}")
+    head = float(captured["t"]) - start
+    tail = end - float(captured["t"])
+    return head, tail, captured["h"]
 
 
-def qwen_tail(
-    model: Any,
-    split_hidden: torch.Tensor,
+def average_split_times(
+    model: torch.nn.Module,
+    batches: list[tuple[torch.Tensor, torch.Tensor]],
     split_k: int,
-    context: tuple[torch.Tensor, torch.Tensor, dict],
-) -> torch.Tensor:
-    """Run Qwen layers after the split, final norm, and LM head."""
-    qwen_model = model.model
-    position_ids, cache_position, extra = context
-    hidden = run_qwen_layers(
-        qwen_model.layers[split_k:],
-        split_hidden,
-        position_ids,
-        cache_position,
-        extra["causal_masks"],
-        extra["position_embeddings"],
-    )
-    hidden = qwen_model.norm(hidden)
-    return model.lm_head(hidden)
+    device: str,
+    warmup_iters: int,
+    measure_iters: int,
+) -> tuple[float, float, list[torch.Tensor]]:
+    """Average head and tail time over measured passes.
+
+    Args:
+        model: Eval-mode model.
+        batches: Device batches of ``(input_ids, mask)``.
+        split_k: Split depth.
+        device: Torch device string.
+        warmup_iters: Untimed passes.
+        measure_iters: Timed passes. Must be positive.
+
+    Returns:
+        Mean head seconds, mean tail seconds, and cut activations
+        from the last measured pass.
+    """
+    saved: list[torch.Tensor] = []
+
+    def once() -> tuple[float, float]:
+        head = 0.0
+        tail = 0.0
+        saved.clear()
+        with torch.inference_mode():
+            for ids, mask in batches:
+                head_s, tail_s, hidden = time_one_forward(
+                    model, ids, mask, split_k, device,
+                )
+                head += head_s
+                tail += tail_s
+                saved.append(hidden)
+        return head, tail
+
+    for _ in range(warmup_iters):
+        once()
+    heads: list[float] = []
+    tails: list[float] = []
+    for _ in range(measure_iters):
+        head, tail = once()
+        heads.append(head)
+        tails.append(tail)
+    if not heads:
+        raise ValueError("measure_iters must be positive")
+    scale = float(len(heads))
+    return sum(heads) / scale, sum(tails) / scale, list(saved)
 
 
 def make_placeholder_state(
@@ -234,11 +307,22 @@ def make_placeholder_state(
     dtype: torch.dtype,
     seed: int,
 ) -> dict[str, torch.Tensor]:
-    """Create random low-rank noise and suppressor placeholders."""
+    """Create random low-rank noise and suppressor placeholders.
+
+    Args:
+        hidden_size: Activation width.
+        rank: Noise rank.
+        device: Torch device string.
+        dtype: Tensor dtype.
+        seed: CPU generator seed.
+
+    Returns:
+        ``U_eta``, ``lam``, ``gamma``, and ``mean`` tensors.
+    """
     gen = torch.Generator(device="cpu").manual_seed(seed)
     basis = torch.randn(hidden_size, rank, generator=gen, dtype=torch.float32)
-    q, _ = torch.linalg.qr(basis, mode="reduced")
-    u_eta = q.to(device=device, dtype=dtype)
+    q_factor, _ = torch.linalg.qr(basis, mode="reduced")
+    u_eta = q_factor.to(device=device, dtype=dtype)
     lam = torch.ones(rank, device=device, dtype=dtype)
     gamma = torch.full((rank,), 0.5, device=device, dtype=dtype)
     mean = torch.zeros(hidden_size, device=device, dtype=dtype)
@@ -249,15 +333,23 @@ def add_lowrank_noise(
     hidden: torch.Tensor,
     state: dict[str, torch.Tensor],
 ) -> torch.Tensor:
-    """Generate and add placeholder low-rank Gaussian noise."""
+    """Generate and add placeholder low-rank Gaussian noise.
+
+    Args:
+        hidden: Cut activation.
+        state: Placeholder noise tensors.
+
+    Returns:
+        Noisy activation of the same shape.
+    """
     rank = state["U_eta"].shape[1]
-    z = torch.randn(
+    factors = torch.randn(
         *hidden.shape[:-1],
         rank,
         device=hidden.device,
         dtype=hidden.dtype,
     )
-    eta = (z * state["lam"].sqrt()) @ state["U_eta"].T
+    eta = (factors * state["lam"].sqrt()) @ state["U_eta"].T
     return hidden + eta
 
 
@@ -265,16 +357,18 @@ def apply_suppressor(
     hidden: torch.Tensor,
     state: dict[str, torch.Tensor],
 ) -> torch.Tensor:
-    """Apply the placeholder private low-rank suppressor."""
+    """Apply the placeholder private low-rank suppressor.
+
+    Args:
+        hidden: Noisy cut activation.
+        state: Placeholder suppressor tensors.
+
+    Returns:
+        Suppressed activation of the same shape.
+    """
     centered = hidden - state["mean"]
     coeff = centered @ state["U_eta"]
     return hidden - (coeff * state["gamma"]) @ state["U_eta"].T
-
-
-def sync_if_needed(device: str) -> None:
-    """Synchronize CUDA timing when needed."""
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
 
 
 def time_callable(
@@ -283,7 +377,17 @@ def time_callable(
     warmup_iters: int,
     measure_iters: int,
 ) -> float:
-    """Return mean elapsed seconds per measured iteration."""
+    """Return mean elapsed seconds per measured iteration.
+
+    Args:
+        fn: Zero-argument timed call.
+        device: Torch device string.
+        warmup_iters: Untimed calls.
+        measure_iters: Timed calls.
+
+    Returns:
+        Mean seconds per measured call.
+    """
     for _ in range(warmup_iters):
         fn()
     sync_if_needed(device)
@@ -294,123 +398,102 @@ def time_callable(
     return (time.perf_counter() - start) / max(1, measure_iters)
 
 
-def load_model(
-    model_id: str,
-    dtype: torch.dtype,
+def measure_components(
+    model: torch.nn.Module,
+    batches: list[tuple[torch.Tensor, torch.Tensor]],
+    state: dict[str, torch.Tensor],
+    split_k: int,
     device: str,
-) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
-    """Load a Hugging Face causal LM and tokenizer."""
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        attn_implementation="sdpa",
-    ).to(device)
-    model.eval()
-    return model, tokenizer
+    warmup_iters: int,
+    measure_iters: int,
+) -> dict[str, float]:
+    """Time full inference and the split noise protocol.
+
+    Args:
+        model: Eval-mode model.
+        batches: Device batches of ``(input_ids, mask)``.
+        state: Placeholder noise and suppressor tensors.
+        split_k: Split depth.
+        device: Torch device string.
+        warmup_iters: Untimed passes.
+        measure_iters: Timed passes.
+
+    Returns:
+        Mean seconds for each timed component.
+    """
+    def baseline_run() -> None:
+        with torch.inference_mode():
+            for ids, mask in batches:
+                model(input_ids=ids, attention_mask=mask)
+
+    baseline_s = time_callable(
+        baseline_run, device, warmup_iters, measure_iters,
+    )
+    head_s, tail_s, hiddens = average_split_times(
+        model, batches, split_k, device, warmup_iters, measure_iters,
+    )
+
+    def noise_run() -> None:
+        with torch.inference_mode():
+            for hidden in hiddens:
+                add_lowrank_noise(hidden, state)
+
+    noise_s = time_callable(
+        noise_run, device, warmup_iters, measure_iters,
+    )
+    with torch.inference_mode():
+        noisy = [add_lowrank_noise(hidden, state) for hidden in hiddens]
+
+    def suppressor_run() -> None:
+        with torch.inference_mode():
+            for hidden in noisy:
+                apply_suppressor(hidden, state)
+
+    suppressor_s = time_callable(
+        suppressor_run, device, warmup_iters, measure_iters,
+    )
+    return {
+        "baseline_full_s": baseline_s,
+        "head_to_split_s": head_s,
+        "noise_generation_s": noise_s,
+        "suppressor_s": suppressor_s,
+        "tail_from_split_s": tail_s,
+    }
 
 
-def benchmark_model(
+def result_row(
     model_id: str,
     args: argparse.Namespace,
     dtype: torch.dtype,
-) -> dict:
-    """Benchmark one model and return a result row."""
-    model, tokenizer = load_model(model_id, dtype, args.device)
-    qwen_model = model.model
-    n_layers = len(qwen_model.layers)
-    if args.split_k > n_layers:
-        raise ValueError(f"split_k={args.split_k} exceeds n_layers={n_layers}")
-    batches = load_batches(
-        tokenizer,
-        args.n_prompts,
-        args.max_len,
-        args.batch_size,
-        args.device,
-        args.seed,
-        args.max_batches,
+    n_layers: int,
+    hidden_size: int,
+    batch_size: int,
+    n_examples: int,
+    times: dict[str, float],
+) -> dict[str, Any]:
+    """Build one successful benchmark row.
+
+    Args:
+        model_id: Hugging Face model id.
+        args: Parsed CLI arguments.
+        dtype: Parameter dtype.
+        n_layers: Decoder depth.
+        hidden_size: Activation width.
+        batch_size: Prompts per forward.
+        n_examples: Number of timed prompts.
+        times: Component times from ``measure_components``.
+
+    Returns:
+        CSV-ready measurement row.
+    """
+    split_s = (
+        times["head_to_split_s"]
+        + times["noise_generation_s"]
+        + times["suppressor_s"]
+        + times["tail_from_split_s"]
     )
-    hidden_size = int(model.config.hidden_size)
-    state = make_placeholder_state(
-        hidden_size,
-        args.rank,
-        args.device,
-        dtype,
-        args.seed,
-    )
-
-    def baseline_run() -> None:
-        for ids, mask in batches:
-            model(input_ids=ids, attention_mask=mask)
-
-    split_inputs = []
-    with torch.inference_mode():
-        for ids, mask in batches:
-            hidden, context = qwen_head(model, ids, mask, args.split_k)
-            split_inputs.append((hidden.detach(), context))
-
-    def head_run() -> None:
-        for ids, mask in batches:
-            qwen_head(model, ids, mask, args.split_k)
-
-    def noise_run() -> None:
-        for hidden, _ in split_inputs:
-            add_lowrank_noise(hidden, state)
-
-    noisy_inputs = []
-    with torch.inference_mode():
-        for hidden, context in split_inputs:
-            noisy_inputs.append((add_lowrank_noise(hidden, state), context))
-
-    def suppressor_run() -> None:
-        for noisy, _ in noisy_inputs:
-            apply_suppressor(noisy, state)
-
-    denoised_inputs = []
-    with torch.inference_mode():
-        for noisy, context in noisy_inputs:
-            denoised_inputs.append((apply_suppressor(noisy, state), context))
-
-    def tail_run() -> None:
-        for hidden, context in denoised_inputs:
-            qwen_tail(model, hidden, args.split_k, context)
-
-    with torch.inference_mode():
-        baseline_s = time_callable(
-            baseline_run,
-            args.device,
-            args.warmup_iters,
-            args.measure_iters,
-        )
-        head_s = time_callable(
-            head_run,
-            args.device,
-            args.warmup_iters,
-            args.measure_iters,
-        )
-        noise_s = time_callable(
-            noise_run,
-            args.device,
-            args.warmup_iters,
-            args.measure_iters,
-        )
-        suppressor_s = time_callable(
-            suppressor_run,
-            args.device,
-            args.warmup_iters,
-            args.measure_iters,
-        )
-        tail_s = time_callable(
-            tail_run,
-            args.device,
-            args.warmup_iters,
-            args.measure_iters,
-        )
-
-    split_s = head_s + noise_s + suppressor_s + tail_s
-    n_examples = sum(int(ids.shape[0]) for ids, _ in batches)
+    baseline = times["baseline_full_s"]
+    slowdown = split_s / baseline if baseline > 0 else float("nan")
     return {
         "model_id": model_id,
         "model_label": model_label(model_id),
@@ -423,20 +506,86 @@ def benchmark_model(
         "split_k": args.split_k,
         "rank": args.rank,
         "n_examples": n_examples,
-        "batch_size": args.batch_size,
+        "batch_size": batch_size,
         "max_len": args.max_len,
-        "baseline_full_s": baseline_s,
-        "head_to_split_s": head_s,
-        "noise_generation_s": noise_s,
-        "suppressor_s": suppressor_s,
-        "tail_from_split_s": tail_s,
         "split_total_s": split_s,
-        "slowdown": split_s / baseline_s if baseline_s > 0 else float("nan"),
+        "slowdown": slowdown,
+        **times,
     }
 
 
-def failed_row(model_id: str, args: argparse.Namespace, exc: Exception) -> dict:
-    """Create a result row for a failed benchmark."""
+def benchmark_model(
+    model_id: str,
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Benchmark one model and return a result row.
+
+    Args:
+        model_id: Hugging Face model id.
+        args: Parsed CLI arguments.
+        dtype: Parameter dtype.
+
+    Returns:
+        CSV-ready measurement row.
+    """
+    model, tokenizer = M.load_model(
+        model_id, dtype=dtype, device=args.device,
+    )
+    n_layers = M.n_layers(model)
+    if args.split_k > n_layers:
+        raise ValueError(
+            f"split_k={args.split_k} exceeds n_layers={n_layers}"
+        )
+    batch_size = args.batch_size
+    batches = load_batches(
+        tokenizer,
+        args.n_prompts,
+        args.max_len,
+        batch_size,
+        args.device,
+        args.seed,
+        args.max_batches,
+    )
+    if not batches:
+        raise ValueError(f"no batches for {model_id}")
+    hidden = M.hidden_size(model)
+    state = make_placeholder_state(
+        hidden, args.rank, args.device, dtype, args.seed,
+    )
+    times = measure_components(
+        model,
+        batches,
+        state,
+        args.split_k,
+        args.device,
+        args.warmup_iters,
+        args.measure_iters,
+    )
+    n_examples = sum(int(ids.shape[0]) for ids, _ in batches)
+    row = result_row(
+        model_id, args, dtype, n_layers, hidden, batch_size,
+        n_examples, times,
+    )
+    del model, tokenizer
+    return row
+
+
+def failed_row(
+    model_id: str,
+    args: argparse.Namespace,
+    exc: Exception,
+) -> dict[str, Any]:
+    """Create a result row for a failed benchmark.
+
+    Args:
+        model_id: Hugging Face model id.
+        args: Parsed CLI arguments.
+        exc: Exception raised by the benchmark.
+
+    Returns:
+        CSV-ready failure row.
+    """
     return {
         "model_id": model_id,
         "model_label": model_label(model_id),
@@ -448,16 +597,31 @@ def failed_row(model_id: str, args: argparse.Namespace, exc: Exception) -> dict:
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
-    """Write benchmark rows to CSV."""
+    """Write benchmark rows to CSV.
+
+    Args:
+        path: Destination CSV path.
+        rows: Result rows.
+    """
     keys = sorted({key for row in rows for key in row})
-    with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=keys)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def write_json(path: Path, args: argparse.Namespace, rows: list[dict]) -> None:
-    """Write benchmark metadata and rows to JSON."""
+def write_json(
+    path: Path,
+    args: argparse.Namespace,
+    rows: list[dict],
+) -> None:
+    """Write benchmark metadata and rows to JSON.
+
+    Args:
+        path: Destination JSON path.
+        args: Parsed CLI arguments.
+        rows: Result rows.
+    """
     payload = {
         "args": {
             key: str(value) if isinstance(value, Path) else value
@@ -468,36 +632,74 @@ def write_json(path: Path, args: argparse.Namespace, rows: list[dict]) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
-def plot_rows(rows: list[dict], out_dir: Path, prefix: str) -> list[Path]:
-    """Plot slowdown ratios and component timings."""
-    ok_rows = [row for row in rows if row.get("status") == "ok"]
-    if not ok_rows:
-        return []
-    plot_dir = util.ART / "plots"
-    plot_dir.mkdir(parents=True, exist_ok=True)
-    labels = [row["model_label"] for row in ok_rows]
-    slowdowns = [float(row["slowdown"]) for row in ok_rows]
-    fig, ax = plt.subplots(figsize=(8.0, 4.8))
-    ax.bar(labels, slowdowns, alpha=0.8)
-    ax.axhline(1.0, color="0.35", linestyle=":", linewidth=1.2)
-    ax.set_ylabel("split + noise + suppressor / full inference")
-    ax.set_xlabel("Qwen2.5 model size")
-    ax.set_title("Inference Slowdown From Low-Rank Noise Suppression")
-    ax.grid(True, axis="y", alpha=0.25)
-    for idx, value in enumerate(slowdowns):
-        ax.text(idx, value, f"{value:.2f}x", ha="center", va="bottom")
-    paths = [
-        out_dir / f"{prefix}_bar.png",
-        plot_dir / f"{prefix}_bar.png",
-    ]
+def _save_fig(fig: Any, paths: list[Path]) -> None:
+    """Save ``fig`` to each path and close it.
+
+    Args:
+        fig: Matplotlib figure.
+        paths: Destination PNG paths.
+    """
     for path in paths:
         fig.tight_layout()
         fig.savefig(path, dpi=180)
         print(f"wrote {path}", flush=True)
     plt.close(fig)
 
-    noise_times = [float(row["noise_generation_s"]) for row in ok_rows]
-    suppressor_times = [float(row["suppressor_s"]) for row in ok_rows]
+
+def plot_slowdown(
+    rows: list[dict],
+    out_dir: Path,
+    prefix: str,
+) -> list[Path]:
+    """Plot the split-to-full slowdown ratio.
+
+    Args:
+        rows: Successful benchmark rows.
+        out_dir: Directory for a copy of the figure.
+        prefix: Filename prefix.
+
+    Returns:
+        Written PNG paths.
+    """
+    labels = [row["model_label"] for row in rows]
+    slowdowns = [float(row["slowdown"]) for row in rows]
+    fig, ax = plt.subplots(figsize=(8.0, 4.8))
+    ax.bar(labels, slowdowns, alpha=0.8)
+    ax.axhline(1.0, color="0.35", linestyle=":", linewidth=1.2)
+    ax.set_ylabel("split + noise + suppressor / full inference")
+    ax.set_xlabel("model")
+    ax.set_title("Inference Slowdown From Low-Rank Noise Suppression")
+    ax.grid(True, axis="y", alpha=0.25)
+    for idx, value in enumerate(slowdowns):
+        ax.text(idx, value, f"{value:.2f}x", ha="center", va="bottom")
+    plot_dir = util.ART / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    paths = [
+        out_dir / f"{prefix}_bar.png",
+        plot_dir / f"{prefix}_bar.png",
+    ]
+    _save_fig(fig, paths)
+    return paths
+
+
+def plot_component_times(
+    rows: list[dict],
+    out_dir: Path,
+    prefix: str,
+) -> list[Path]:
+    """Plot noise-addition and suppression time.
+
+    Args:
+        rows: Successful benchmark rows.
+        out_dir: Directory for a copy of the figure.
+        prefix: Filename prefix.
+
+    Returns:
+        Written PNG paths.
+    """
+    labels = [row["model_label"] for row in rows]
+    noise_times = [float(row["noise_generation_s"]) for row in rows]
+    suppressor_times = [float(row["suppressor_s"]) for row in rows]
     x_pos = list(range(len(labels)))
     width = 0.38
     fig, ax = plt.subplots(figsize=(8.0, 4.8))
@@ -518,20 +720,38 @@ def plot_rows(rows: list[dict], out_dir: Path, prefix: str) -> list[Path]:
     ax.set_xticks(x_pos)
     ax.set_xticklabels(labels)
     ax.set_ylabel("seconds per benchmark iteration")
-    ax.set_xlabel("Qwen2.5 model size")
+    ax.set_xlabel("model")
     ax.set_title("Absolute Noise Addition and Suppression Time")
     ax.grid(True, axis="y", alpha=0.25)
     ax.legend(fontsize=9)
-    timing_paths = [
+    paths = [
         out_dir / f"{prefix}_noise_suppressor_times.png",
-        plot_dir / f"{prefix}_noise_suppressor_times.png",
+        util.ART / "plots" / f"{prefix}_noise_suppressor_times.png",
     ]
-    for path in timing_paths:
-        fig.tight_layout()
-        fig.savefig(path, dpi=180)
-        print(f"wrote {path}", flush=True)
-    plt.close(fig)
-    paths.extend(timing_paths)
+    _save_fig(fig, paths)
+    return paths
+
+
+def plot_rows(
+    rows: list[dict],
+    out_dir: Path,
+    prefix: str,
+) -> list[Path]:
+    """Plot slowdown ratios and component timings.
+
+    Args:
+        rows: Benchmark rows, including failures.
+        out_dir: Directory for copies of the figures.
+        prefix: Filename prefix.
+
+    Returns:
+        Written PNG paths. Empty when every row failed.
+    """
+    ok_rows = [row for row in rows if row.get("status") == "ok"]
+    if not ok_rows:
+        return []
+    paths = plot_slowdown(ok_rows, out_dir, prefix)
+    paths.extend(plot_component_times(ok_rows, out_dir, prefix))
     return paths
 
 
@@ -546,11 +766,12 @@ def main() -> None:
     """Run the inference slowdown benchmark."""
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    dtype = resolve_dtype(args.dtype, args.device)
+    (util.ART / "plots").mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
     rows = []
     for model_id in args.models:
         print(f"\n--- benchmarking {model_id} ---", flush=True)
+        dtype = resolve_dtype(args.dtype, args.device)
         try:
             rows.append(benchmark_model(model_id, args, dtype))
         except Exception as exc:

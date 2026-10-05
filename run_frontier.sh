@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# Reproduce the one-shot privacy/utility frontier diagram for the lowrank_struct
-# server-private suppressor (Qwen2.5-0.5B, SST-2, split k=8, rank 8).
+# Reproduce the one-shot privacy/utility frontier for the lowrank_struct
+# server-private suppressor on SST-2 (split k=8, rank 8).
 #
-# Output plot: artifacts/plots/setting_g_qwen_sst2_lowrank_private_suppressor_exact_privacy_utility_frontier.png
+#   MODEL=Qwen/Qwen2.5-0.5B ./run_frontier.sh
+#   MODEL=Qwen/Qwen3.5-4B  ./run_frontier.sh
 #
-# Requires a GPU + the project env (PyTorch, transformers). Set PY to its python.
+# Requires a GPU and the project env (PyTorch, transformers>=5.5).
+# Set PY to that interpreter.
 set -euo pipefail
 
-PY="${PY:-/Users/qinghuazhou/mambaforge/envs/formal-forge/bin/python}"
+PY="${PY:-python}"
 DEVICE="${DEVICE:-cuda:0}"
-MODEL="Qwen/Qwen2.5-0.5B"
-K=8
-RANK=8
+MODEL="${MODEL:-Qwen/Qwen2.5-0.5B}"
+K="${K:-8}"
+RANK="${RANK:-8}"
 SEED="${SEED:-0}"
 SFS="0.01 0.02 0.03 0.04 0.05 0.075 0.1 0.125 0.15 0.2 0.25 0.3 0.35 0.4 0.5 0.75 1.0 1.25 1.5 3.0 6.0 10.0"
+SAFE_MODEL="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/_/g')"
+OUT_TAG="${SAFE_MODEL}_sst2_lowrank_private_suppressor"
+PREFIX="setting_g_${OUT_TAG}"
 
 # Single reproducibility knob. SEED is passed to every stage, where
 # src/seeding.set_seed() seeds the global Python/NumPy/Torch/CUDA RNGs and pins
@@ -54,6 +59,9 @@ fi
 # Scaffolding dirs the source scripts assume exist (committed in the original repo).
 mkdir -p artifacts/reports artifacts/plots "$HF_HOME" "$HF_HUB_CACHE"
 
+echo "Model: $MODEL"
+echo "Outputs: artifacts/${PREFIX}/ and artifacts/plots/${PREFIX}_*.png"
+
 # 1. Cache clean + clipped cut activations, answer-position features, task head (LM-head rows).
 $PY scripts/01_collect_calibration.py --device "$DEVICE" --models "$MODEL" --ks $K --seed "$SEED"
 
@@ -80,13 +88,24 @@ $PY scripts/15_eval_tnsc.py --device "$DEVICE" --task sst2 --models "$MODEL" --k
     --variants clean_no_noise b1_lowrank_struct b1_lowrank_struct_private_suppressor \
     --K 2 --repeats 1 --n-attack-prompts 30 --attack-split test \
     --positions 2 5 8 10 12 15 18 20 --seeds "$SEED" \
-    --out-tag qwen_sst2_lowrank_private_suppressor
+    --out-tag "$OUT_TAG"
 
 # 7. Render the four plots, including the privacy/utility frontier.
 $PY scripts/17_plot_lowrank_private_suppressor.py \
-    --csv artifacts/setting_g_qwen_sst2_lowrank_private_suppressor/tnsc_eval.csv \
-    --prefix setting_g_qwen_sst2_lowrank_private_suppressor
+    --csv "artifacts/${PREFIX}/tnsc_eval.csv" \
+    --prefix "$PREFIX"
+
+# 8. Time full inference against the split, noise, and suppressor.
+$PY scripts/18_measure_inference_slowdown.py \
+    --device "$DEVICE" --models "$MODEL" --split-k "$K" --rank "$RANK" \
+    --seed "$SEED" --prefix "${OUT_TAG}_inference_slowdown"
 
 echo
-echo "Frontier diagram:"
-echo "  artifacts/plots/setting_g_qwen_sst2_lowrank_private_suppressor_exact_privacy_utility_frontier.png"
+echo "Metrics: artifacts/${PREFIX}/tnsc_eval.csv"
+echo "Plots:"
+echo "  artifacts/plots/${PREFIX}_utility_vs_scale.png"
+echo "  artifacts/plots/${PREFIX}_eve_vs_scale.png"
+echo "  artifacts/plots/${PREFIX}_exact_privacy_utility_frontier.png"
+echo "  artifacts/plots/${PREFIX}_gain_and_clean_distortion.png"
+echo "  artifacts/plots/${OUT_TAG}_inference_slowdown_bar.png"
+echo "  artifacts/plots/${OUT_TAG}_inference_slowdown_noise_suppressor_times.png"

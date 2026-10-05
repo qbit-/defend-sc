@@ -22,11 +22,14 @@ def estimate_g_priv(model, ids, k, prefix_lens=(2, 5, 10, 20), n_top=80, n_rand=
     for t in prefix_lens:
         if t >= ids.shape[1]: continue
         top = CS.topk_candidates(model, ids, position=t, k_top=n_top)
-        rand = CS.random_candidates(model.config.vocab_size, ids.shape[0], n_rand,
-                                    seed=12345 + t).to(ids.device)
+        rand = CS.random_candidates(
+            M.vocab_size(model), ids.shape[0], n_rand, seed=12345 + t,
+        ).to(ids.device)
         cand = torch.cat([top, rand], dim=1)
-        cloud = CS.candidate_cloud(model, ids, position=t, candidate_ids=cand,
-                                   k_split=k, chunk_size=256)
+        cloud = CS.candidate_cloud(
+            model, ids, position=t, candidate_ids=cand,
+            k_split=k, chunk_size=M.cloud_chunk_size(model),
+        )
         for b in range(cloud.shape[0]):
             X = cloud[b].float() - cloud[b].float().mean(dim=0, keepdim=True)
             n_x = X.norm(dim=-1, keepdim=True).clamp(min=1e-12)
@@ -132,8 +135,11 @@ def main():
     rows = []
     for mid in args.models:
         for k in args.ks:
-            r = run_one(mid, k, dtype=torch.float32, device=args.device,
-                        sigma0_fracs=tuple(args.sfs), ranks=tuple(args.ranks))
+            r = run_one(
+                mid, k, dtype=M.default_dtype(mid, args.device),
+                device=args.device, sigma0_fracs=tuple(args.sfs),
+                ranks=tuple(args.ranks),
+            )
             if r: rows.append(r)
     util.write_json(util.ART / "covariance_summary.json", {"rows": rows})
     rep = ["# Phase 3-4 SST-2 Geometry & Covariance", "",

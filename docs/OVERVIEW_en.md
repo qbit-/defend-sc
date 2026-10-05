@@ -155,7 +155,7 @@ of adding low-rank activation noise and applying the private suppressor. This is
 a timing-only benchmark: it does not estimate noise subspaces from the data. Instead,
 for each model it generates a random orthonormal placeholder $U_\eta \in \mathbb{R}^{H \times r}$ with the correct hidden size $H$ and rank $r$.
 
-For each Qwen2.5 model, the benchmark first measures ordinary full-model
+For each model, the benchmark first measures ordinary full-model
 inference $t_{\mathrm{full}}$.
 
 It then measures the split protocol as separate timed components:
@@ -212,10 +212,10 @@ $$
 
 The benchmark parameters are:
 
-- Models: Qwen2.5-0.5B, Qwen2.5-1.5B, Qwen2.5-3B, and Qwen2.5-7B.
+- Models: Qwen2.5-0.5B, Qwen2.5-1.5B, Qwen2.5-3B, Qwen2.5-7B, and Qwen3.5-4B.
 - Dataset: GLUE SST-2 validation prompts.
 - Number of prompts: 256.
-- Batch size: 32.
+- Batch size: 4.
 - Maximum sequence length: 64.
 - Split layer: $k=8$.
 - Noise rank: $r=8$.

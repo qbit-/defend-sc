@@ -55,7 +55,7 @@ def attack_positions(model, ids: torch.Tensor, mask: torch.Tensor,
     """
     device = a_tilde.device
     B, T, H = a_tilde.shape
-    vocab = model.config.vocab_size
+    vocab = M.vocab_size(model)
     correct1 = 0; total = 0
     correct1_per_pos = {int(p): {"correct": 0, "total": 0} for p in positions}
     for t in positions:

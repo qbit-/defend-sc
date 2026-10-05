@@ -1,7 +1,9 @@
 # Experimental code for securing activation channel against SIPIT attack
 
 Experimental code to produce the **privacy / utility
-frontier** diagram on Qwen2.5-0.5B on the SST-2 benchmark\.
+frontier** diagram on SST-2. The default checkpoint is
+Qwen2.5-0.5B. Set `MODEL=Qwen/Qwen3.5-4B` to run the same
+pipeline on the Qwen3.5-4B text decoder.
 
 ## What the frontier shows
 
@@ -20,7 +22,7 @@ src/                     # transitive import closure (12 modules)
   private_denoise.py     #   PrivateLowrankStructSuppressor (the D_priv being tested)
   attacks/exact_dist.py  #   exact Gaussian log-likelihood scoring (exact Eve)
   attacks/sipit.py       #   per-position candidate-cloud attack (token_top1)
-scripts/                 # 7-stage pipeline (run in order; see run_frontier.sh)
+scripts/                 # 8-stage pipeline (run in order; see run_frontier.sh)
 run_frontier.sh          # end-to-end driver
 ```
 
@@ -35,15 +37,67 @@ Find a detailed overview of the code and the method in [Overview](./docs/OVERVIE
 5. `14b_train_private_denoiser.py`: `PrivateLowrankStructSuppressor` per noise scale (fit on train split)
 6. `15_eval_tnsc.py`: evaluate exact Eve and SST-2 accuracy across noise scales, with and without the suppressor; write `tnsc_eval.csv`
 7. `17_plot_lowrank_private_suppressor.py`: the four plots, incl. the frontier `.png
+8. `18_measure_inference_slowdown.py`: full-forward vs split, noise, and suppressor time
 
-Run it all:
+Run the full metric and plot sequence. Weights use bfloat16 when
+CUDA supports it, otherwise float32, and the batch size is 4.
+`transformers>=5.5` is required for Qwen3.5.
+Change `MODEL` to switch checkpoints. `Qwen/Qwen3.5-4B` loads the
+text decoder and drops the unused vision tower.
 
 ```bash
-PY=/path/to/env/python DEVICE=cuda:0 ./run_frontier.sh
+export PY=python
+export DEVICE=cuda:0
+export SEED=0
+export MODEL=Qwen/Qwen2.5-0.5B
+# export MODEL=Qwen/Qwen3.5-4B
+export K=8
+export RANK=8
+export SFS="0.01 0.02 0.03 0.04 0.05 0.075 0.1 0.125 0.15 0.2 0.25 0.3 0.35 0.4 0.5 0.75 1.0 1.25 1.5 3.0 6.0 10.0"
+OUT_TAG="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/_/g')_sst2_lowrank_private_suppressor"
+
+$PY scripts/01_collect_calibration.py --device "$DEVICE" --models "$MODEL" --ks $K --seed "$SEED"
+$PY scripts/02_subspace_alignment.py --device "$DEVICE" --models "$MODEL" --ks $K --seed "$SEED"
+$PY scripts/04_build_covariance.py --device "$DEVICE" --models "$MODEL" --ks $K --ranks $RANK --sfs 0.5 --seed "$SEED"
+$PY scripts/12b_scale_lowrank_noise.py --models "$MODEL" --ks $K --rank $RANK --families lowrank_struct --base-sf 0.5 --target-sfs $SFS --overwrite --seed "$SEED"
+$PY scripts/14b_train_private_denoiser.py --task sst2 --models "$MODEL" --ks $K --ranks $RANK --families lowrank_struct --sfs $SFS --seed "$SEED"
+$PY scripts/15_eval_tnsc.py --device "$DEVICE" --task sst2 --models "$MODEL" --ks $K --ranks $RANK --sfs $SFS \
+    --variants clean_no_noise b1_lowrank_struct b1_lowrank_struct_private_suppressor \
+    --K 2 --repeats 1 --n-attack-prompts 30 --attack-split test \
+    --positions 2 5 8 10 12 15 18 20 --seeds "$SEED" \
+    --out-tag "$OUT_TAG"
+$PY scripts/17_plot_lowrank_private_suppressor.py \
+    --csv artifacts/setting_g_${OUT_TAG}/tnsc_eval.csv \
+    --prefix setting_g_${OUT_TAG}
+$PY scripts/18_measure_inference_slowdown.py --device "$DEVICE" --models "$MODEL" \
+    --split-k "$K" --rank "$RANK" --seed "$SEED" \
+    --prefix "${OUT_TAG}_inference_slowdown"
 ```
 
-The figures land at
-`artifacts/plots/`.
+Or run the wrapper:
+
+```bash
+PY=python DEVICE=cuda:0 ./run_frontier.sh
+MODEL=Qwen/Qwen3.5-4B PY=python DEVICE=cuda:0 ./run_frontier.sh
+```
+
+Metrics land in `artifacts/setting_g_${OUT_TAG}/tnsc_eval.csv`.
+The four figures land in `artifacts/plots/`:
+
+- `setting_g_${OUT_TAG}_utility_vs_scale.png`
+- `setting_g_${OUT_TAG}_eve_vs_scale.png`
+- `setting_g_${OUT_TAG}_exact_privacy_utility_frontier.png`
+- `setting_g_${OUT_TAG}_gain_and_clean_distortion.png`
+- `${OUT_TAG}_inference_slowdown_bar.png`
+- `${OUT_TAG}_inference_slowdown_noise_suppressor_times.png`
+
+Slowdown metrics also land in
+`artifacts/inference_slowdown/${OUT_TAG}_inference_slowdown.csv`.
+A standalone sweep of the Qwen2.5 sizes plus Qwen3.5-4B is:
+
+```bash
+$PY scripts/18_measure_inference_slowdown.py --device "$DEVICE"
+```
 
 ## Exporting Markdown documents to PDF
 

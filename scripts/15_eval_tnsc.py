@@ -198,7 +198,7 @@ def build_or_load_clouds(model, model_id: str, k: int, ids: torch.Tensor,
             return blob
 
     ids_dev = ids.to(device)
-    vocab = model.config.vocab_size
+    vocab = M.vocab_size(model)
     B, T = ids.shape
     blob = {}
     for t in positions:
@@ -223,20 +223,105 @@ def build_or_load_clouds(model, model_id: str, k: int, ids: torch.Tensor,
 
 
 @torch.no_grad()
-def server_logits_for(model, k: int, ids, mask, ans_pos, hidden, task_weights, device, dtype,
-                      task_bias=None, label_token_ids=None):
-    out = SM.split_run(model, ids.to(device), k=k, hidden_override=hidden.to(device, dtype),
-                       attention_mask=mask.to(device))
+def _server_logits_chunk(
+    model: torch.nn.Module,
+    k: int,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    ans_pos: torch.Tensor,
+    hidden: torch.Tensor,
+    task_weights: torch.Tensor,
+    device: str,
+    dtype: torch.dtype,
+    task_bias: torch.Tensor | None = None,
+    label_token_ids: list | None = None,
+) -> torch.Tensor:
+    """Score one batch of split activations.
+
+    Args:
+        model: Loaded causal model.
+        k: Split depth.
+        ids: Token ids for this batch.
+        mask: Attention mask for this batch.
+        ans_pos: Answer positions for this batch.
+        hidden: Cut activations for this batch.
+        task_weights: Label rows of the LM head.
+        device: Torch device.
+        dtype: Activation dtype.
+        task_bias: Optional label bias.
+        label_token_ids: Verbalizer token ids, when known.
+
+    Returns:
+        Label logits of shape ``[batch, n_classes]`` on CPU.
+    """
+    out = SM.split_run(
+        model, ids.to(device), k=k,
+        hidden_override=hidden.to(device, dtype),
+        attention_mask=mask.to(device),
+    )
     if label_token_ids is not None:
-        pos = ans_pos.to(device).view(-1, 1, 1).expand(-1, 1, out["logits"].shape[-1])
+        pos = ans_pos.to(device).view(-1, 1, 1)
+        pos = pos.expand(-1, 1, out["logits"].shape[-1])
         last = out["logits"].gather(1, pos).squeeze(1)
         label_ids = torch.tensor(label_token_ids, device=device)
         return last.index_select(-1, label_ids).cpu().float()
-    feat = D.gather_answer_position(out["server_out"], ans_pos.to(device)).cpu().float()
+    feat = D.gather_answer_position(
+        out["server_out"], ans_pos.to(device),
+    ).cpu().float()
     logits = feat @ task_weights.float().T
     if task_bias is not None:
         logits = logits + task_bias.float()
     return logits
+
+
+@torch.no_grad()
+def server_logits_for(
+    model: torch.nn.Module,
+    k: int,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    ans_pos: torch.Tensor,
+    hidden: torch.Tensor,
+    task_weights: torch.Tensor,
+    device: str,
+    dtype: torch.dtype,
+    task_bias: torch.Tensor | None = None,
+    label_token_ids: list | None = None,
+) -> torch.Tensor:
+    """Score split activations, chunked for Qwen3.5.
+
+    Args:
+        model: Loaded causal model.
+        k: Split depth.
+        ids: Token ids.
+        mask: Attention mask.
+        ans_pos: Answer positions.
+        hidden: Cut activations.
+        task_weights: Label rows of the LM head.
+        device: Torch device.
+        dtype: Activation dtype.
+        task_bias: Optional label bias.
+        label_token_ids: Verbalizer token ids, when known.
+
+    Returns:
+        Label logits of shape ``[batch, n_classes]`` on CPU.
+    """
+    batch = M.forward_batch_size(model)
+    n = ids.shape[0]
+    if batch <= 0 or n <= batch:
+        return _server_logits_chunk(
+            model, k, ids, mask, ans_pos, hidden, task_weights,
+            device, dtype, task_bias, label_token_ids,
+        )
+    parts = []
+    for start in range(0, n, batch):
+        stop = min(start + batch, n)
+        parts.append(_server_logits_chunk(
+            model, k, ids[start:stop], mask[start:stop],
+            ans_pos[start:stop], hidden[start:stop], task_weights,
+            device, dtype, task_bias, label_token_ids,
+        ))
+    return torch.cat(parts, dim=0)
 
 
 @torch.no_grad()
@@ -336,8 +421,10 @@ def attack_metrics(model, model_id: str, k: int, cache: dict, cov: N.GaussianCov
     ids = attack_cache["ids"][:n_attack_prompts]
     mask = attack_cache["mask"][:n_attack_prompts]
     clipped_a = attack_cache["clipped_a"][:n_attack_prompts]
-    clouds = build_or_load_clouds(model, model_id, k, ids, positions, top_k=80,
-                                  n_rand=20, chunk=256, device=device)
+    clouds = build_or_load_clouds(
+        model, model_id, k, ids, positions, top_k=80,
+        n_rand=20, chunk=M.cloud_chunk_size(model), device=device,
+    )
 
     ids_dev = ids.to(device)
     mask_dev = mask.to(device)
@@ -506,9 +593,9 @@ def main():
     )
     run_id = run_meta["run_id"]
     rows = []
-    dtype = torch.float32
 
     for model_id in args.models:
+        dtype = M.default_dtype(model_id, args.device)
         model = None
         for k in args.ks:
             cpath = cache_path(model_id, k, task=args.task)

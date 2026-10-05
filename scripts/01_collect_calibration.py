@@ -174,18 +174,14 @@ def main():
     ap.add_argument("--n_test", type=int, default=256)
     ap.add_argument("--max-len", type=int, default=64)
     ap.add_argument("--clip-quantile", type=float, default=0.95)
-    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--batch-size", type=int, default=M.DEFAULT_BATCH)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     seeding.set_seed(args.seed)
 
     rows = []
-    dtype_by_model = {
-        "gpt2": torch.float32,
-        "Qwen/Qwen2.5-0.5B": torch.float32,
-    }
     for mid in args.models:
-        dt = dtype_by_model.get(mid, torch.float32)
+        dt = M.default_dtype(mid, args.device)
         for k in args.ks:
             r = collect_one(mid, k, n_train=args.n_train, n_test=args.n_test,
                             max_len=args.max_len, dtype=dt, device=args.device,
