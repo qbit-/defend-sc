@@ -15,7 +15,37 @@ from src import util
 from src import seeding
 
 
-def per_position_clip(a: torch.Tensor, C: float):
+def activation_norm_quantile(
+    norms: torch.Tensor, quantile: float
+) -> float:
+    """Quantile of activation norms in float32.
+
+    ``torch.quantile`` accepts only float32 and float64. CUDA runs
+    cache activations as bfloat16 or float16.
+
+    Args:
+        norms: Per-position activation norms.
+        quantile: Quantile in ``[0, 1]``.
+
+    Returns:
+        The requested quantile as a Python float.
+    """
+    flat = norms.flatten().to(dtype=torch.float32)
+    return float(torch.quantile(flat, quantile))
+
+
+def per_position_clip(
+    a: torch.Tensor, C: float
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Clip each position's hidden state to an L2 norm of ``C``.
+
+    Args:
+        a: Activations with shape ``[batch, time, hidden]``.
+        C: Maximum allowed L2 norm.
+
+    Returns:
+        Clipped activations and norm diagnostics.
+    """
     norm = a.norm(dim=-1, keepdim=True)
     scale = (C / norm).clamp(max=1.0)
     clipped = a * scale
@@ -23,7 +53,7 @@ def per_position_clip(a: torch.Tensor, C: float):
         "C": C,
         "frac_clipped": float((norm.squeeze(-1) > C).float().mean()),
         "norm_p50": float(norm.median()),
-        "norm_p95": float(torch.quantile(norm.flatten(), 0.95)),
+        "norm_p95": activation_norm_quantile(norm, 0.95),
         "norm_max": float(norm.max()),
     }
     return clipped, diag
@@ -87,7 +117,7 @@ def collect_one(model_id, k, n_train=512, n_test=256, max_len=64,
 
     # Choose clip C from train clean norms
     norms = train["clean_a"].norm(dim=-1)
-    C = float(torch.quantile(norms.flatten(), clip_quantile))
+    C = activation_norm_quantile(norms, clip_quantile)
     clipped_a_train, diag_train = per_position_clip(train["clean_a"], C)
     clipped_a_test, diag_test = per_position_clip(test["clean_a"], C)
 
