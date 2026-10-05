@@ -37,8 +37,8 @@ except Exception:
     pass
 
 from src import models as M
-from src import sst2_data as D
 from src import util
+from src.tasks import get_task
 
 
 DEFAULT_MODELS = (
@@ -66,9 +66,10 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--split-k", type=int, default=8)
     ap.add_argument("--rank", type=int, default=8)
+    ap.add_argument("--task", default="sst2")
     ap.add_argument("--n-prompts", type=int, default=256)
     ap.add_argument("--batch-size", type=int, default=M.DEFAULT_BATCH)
-    ap.add_argument("--max-len", type=int, default=64)
+    ap.add_argument("--max-len", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--warmup-iters", type=int, default=2)
     ap.add_argument("--measure-iters", type=int, default=5)
@@ -78,12 +79,8 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Limit batches for smoke tests; 0 uses all batches.",
     )
-    ap.add_argument(
-        "--out-dir",
-        type=Path,
-        default=util.ART / "inference_slowdown",
-    )
-    ap.add_argument("--prefix", default="qwen_inference_slowdown")
+    ap.add_argument("--out-dir", type=Path, default=None)
+    ap.add_argument("--prefix", default="inference_slowdown")
     return ap.parse_args()
 
 
@@ -126,28 +123,28 @@ def load_batches(
     device: str,
     seed: int,
     max_batches: int,
+    task_name: str = "sst2",
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Load SST-2 validation prompts and return device batches.
+    """Load benchmark prompts and return device batches.
 
     Args:
         tokenizer: Tokenizer used to encode prompts.
-        n_prompts: Number of validation prompts.
+        n_prompts: Number of eval prompts.
         max_len: Maximum token length.
         batch_size: Prompts per forward.
         device: Torch device string.
         seed: Shuffle seed.
         max_batches: Cap on batches. ``0`` keeps all batches.
+        task_name: Benchmark name.
 
     Returns:
         List of ``(input_ids, attention_mask)`` batches.
     """
-    examples = D.load_sst2(split="validation", n=n_prompts, seed=seed)
-    ids, mask, _ = D.encode_prompts(
-        tokenizer,
-        examples,
-        max_len=max_len,
-        device=device,
-    )
+    task = get_task(task_name)
+    examples = task.load_split("test", n_prompts, seed)
+    encoded = task.encode(tokenizer, examples, max_len, device)
+    ids = encoded["input_ids"]
+    mask = encoded["attention_mask"]
     batches = []
     for start in range(0, ids.shape[0], batch_size):
         if max_batches and len(batches) >= max_batches:
@@ -546,6 +543,7 @@ def benchmark_model(
         args.device,
         args.seed,
         args.max_batches,
+        args.task,
     )
     if not batches:
         raise ValueError(f"no batches for {model_id}")
@@ -650,6 +648,7 @@ def plot_slowdown(
     rows: list[dict],
     out_dir: Path,
     prefix: str,
+    plot_dir: Path,
 ) -> list[Path]:
     """Plot the split-to-full slowdown ratio.
 
@@ -672,7 +671,6 @@ def plot_slowdown(
     ax.grid(True, axis="y", alpha=0.25)
     for idx, value in enumerate(slowdowns):
         ax.text(idx, value, f"{value:.2f}x", ha="center", va="bottom")
-    plot_dir = util.ART / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     paths = [
         out_dir / f"{prefix}_bar.png",
@@ -686,6 +684,7 @@ def plot_component_times(
     rows: list[dict],
     out_dir: Path,
     prefix: str,
+    plot_dir: Path,
 ) -> list[Path]:
     """Plot noise-addition and suppression time.
 
@@ -726,7 +725,7 @@ def plot_component_times(
     ax.legend(fontsize=9)
     paths = [
         out_dir / f"{prefix}_noise_suppressor_times.png",
-        util.ART / "plots" / f"{prefix}_noise_suppressor_times.png",
+        plot_dir / f"{prefix}_noise_suppressor_times.png",
     ]
     _save_fig(fig, paths)
     return paths
@@ -736,6 +735,7 @@ def plot_rows(
     rows: list[dict],
     out_dir: Path,
     prefix: str,
+    plot_dir: Path,
 ) -> list[Path]:
     """Plot slowdown ratios and component timings.
 
@@ -743,6 +743,7 @@ def plot_rows(
         rows: Benchmark rows, including failures.
         out_dir: Directory for copies of the figures.
         prefix: Filename prefix.
+        plot_dir: Plot directory.
 
     Returns:
         Written PNG paths. Empty when every row failed.
@@ -750,8 +751,8 @@ def plot_rows(
     ok_rows = [row for row in rows if row.get("status") == "ok"]
     if not ok_rows:
         return []
-    paths = plot_slowdown(ok_rows, out_dir, prefix)
-    paths.extend(plot_component_times(ok_rows, out_dir, prefix))
+    paths = plot_slowdown(ok_rows, out_dir, prefix, plot_dir)
+    paths.extend(plot_component_times(ok_rows, out_dir, prefix, plot_dir))
     return paths
 
 
@@ -762,11 +763,38 @@ def cleanup_model() -> None:
         torch.cuda.empty_cache()
 
 
+def _slowdown_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
+    """Choose the CSV directory and the plot directory.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Output directory and plot directory.
+    """
+    if args.out_dir is not None:
+        return args.out_dir, args.out_dir
+    if len(args.models) == 1:
+        model_id = args.models[0]
+        return (
+            util.art_path("inference_slowdown", model_id, args.task),
+            util.art_path("plots", model_id, args.task),
+        )
+    return (
+        util.ART / "inference_slowdown" / "comparison" / args.task,
+        util.ART / "plots" / "comparison" / args.task,
+    )
+
+
 def main() -> None:
     """Run the inference slowdown benchmark."""
     args = parse_args()
+    task = get_task(args.task)
+    if args.max_len is None:
+        args.max_len = task.max_len
+    args.out_dir, plot_dir = _slowdown_dirs(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    (util.ART / "plots").mkdir(parents=True, exist_ok=True)
+    plot_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
     rows = []
     for model_id in args.models:
@@ -786,7 +814,7 @@ def main() -> None:
     write_json(json_path, args, rows)
     print(f"wrote {csv_path}", flush=True)
     print(f"wrote {json_path}", flush=True)
-    plot_rows(rows, args.out_dir, args.prefix)
+    plot_rows(rows, args.out_dir, args.prefix, plot_dir)
 
 
 if __name__ == "__main__":

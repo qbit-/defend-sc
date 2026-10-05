@@ -1,8 +1,122 @@
-"""Binary classification metrics for SST-2 sentiment."""
+"""Classification and string metrics for downstream utility."""
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+
+
+def normalize_prediction(text: str) -> str:
+    """Return the first line with collapsed whitespace.
+
+    Args:
+        text: Model output or reference string.
+
+    Returns:
+        Case-sensitive text with one space between tokens.
+    """
+    line = text.split("\n", 1)[0]
+    return " ".join(line.strip().split())
+
+
+def levenshtein(left: str, right: str) -> int:
+    """Return the character Levenshtein distance.
+
+    Args:
+        left: First string.
+        right: Second string.
+
+    Returns:
+        Minimum insertions, deletions, and substitutions.
+    """
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous = list(range(len(right) + 1))
+    for index, char in enumerate(left, start=1):
+        current = [index]
+        for other_index, other in enumerate(right, start=1):
+            insert = current[other_index - 1] + 1
+            delete = previous[other_index] + 1
+            replace = previous[other_index - 1] + (char != other)
+            current.append(min(insert, delete, replace))
+        previous = current
+    return previous[-1]
+
+
+def exact_match(prediction: str, target: str) -> float:
+    """Return 1 when normalized strings are equal.
+
+    Args:
+        prediction: Model output.
+        target: Reference answer.
+
+    Returns:
+        1.0 for a match and 0.0 otherwise.
+    """
+    return float(
+        normalize_prediction(prediction) == normalize_prediction(target)
+    )
+
+
+def char_edit_similarity(prediction: str, target: str) -> float:
+    """Return one minus the normalized character edit distance.
+
+    Args:
+        prediction: Model output.
+        target: Reference answer.
+
+    Returns:
+        Similarity in ``[0, 1]``. Two empty strings score 1.
+    """
+    left = normalize_prediction(prediction)
+    right = normalize_prediction(target)
+    if not left and not right:
+        return 1.0
+    distance = levenshtein(left, right)
+    return 1.0 - distance / max(len(left), len(right))
+
+
+def mean_exact_match(predictions: list[str], targets: list[str]) -> float:
+    """Return the mean exact-match score.
+
+    Args:
+        predictions: Model outputs.
+        targets: Reference answers, aligned with ``predictions``.
+
+    Returns:
+        Mean exact match. Empty input scores 0.
+    """
+    if not predictions:
+        return 0.0
+    scores = [
+        exact_match(pred, gold)
+        for pred, gold in zip(predictions, targets)
+    ]
+    return float(sum(scores) / len(scores))
+
+
+def mean_char_edit_similarity(
+    predictions: list[str], targets: list[str],
+) -> float:
+    """Return the mean character-edit similarity.
+
+    Args:
+        predictions: Model outputs.
+        targets: Reference answers, aligned with ``predictions``.
+
+    Returns:
+        Mean similarity. Empty input scores 0.
+    """
+    if not predictions:
+        return 0.0
+    scores = [
+        char_edit_similarity(pred, gold)
+        for pred, gold in zip(predictions, targets)
+    ]
+    return float(sum(scores) / len(scores))
 
 
 def accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:

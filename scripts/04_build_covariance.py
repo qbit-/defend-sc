@@ -15,7 +15,7 @@ from src import seeding
 
 @torch.no_grad()
 def estimate_g_priv(model, ids, k, prefix_lens=(2, 5, 10, 20), n_top=80, n_rand=20,
-                   attention_mask=None):
+                   attention_mask=None, row_mask=None):
     H = M.hidden_size(model)
     G_acc = torch.zeros(H, H)
     n = 0
@@ -31,6 +31,8 @@ def estimate_g_priv(model, ids, k, prefix_lens=(2, 5, 10, 20), n_top=80, n_rand=
             k_split=k, chunk_size=M.cloud_chunk_size(model),
         )
         for b in range(cloud.shape[0]):
+            if row_mask is not None and not bool(row_mask[b, t]):
+                continue
             X = cloud[b].float() - cloud[b].float().mean(dim=0, keepdim=True)
             n_x = X.norm(dim=-1, keepdim=True).clamp(min=1e-12)
             Xn = X / n_x
@@ -63,24 +65,42 @@ def build_covariances(G_priv, G_util, hidden, sigma0, rank, total_extra_var, rho
 
 @torch.no_grad()
 def run_one(model_id, k, device="cuda:0", dtype=torch.float32,
-            sigma0_fracs=(0.5, 1.5, 3.0, 6.0, 10.0), ranks=(16,)):
-    print(f"\n--- covariance build {model_id}  k={k} ---", flush=True)
-    safe = model_id.replace("/", "_")
-    cache_p = util.ART / "activations" / safe / "sst2" / f"split_{k}" / "cache.pt"
-    geom_dir = util.ART / "geometry" / safe / "sst2" / f"split_{k}"
+            sigma0_fracs=(0.5, 1.5, 3.0, 6.0, 10.0), ranks=(16,),
+            task_name="sst2", prefix_lens=None):
+    print(f"\n--- covariance build {task_name} {model_id}  k={k} ---", flush=True)
+    cache_p = util.art_path(
+        "activations", model_id, task_name, f"split_{k}", "cache.pt",
+    )
+    geom_dir = util.art_path("geometry", model_id, task_name, f"split_{k}")
     if not (geom_dir / "U_T.pt").exists():
         print(f"  no Phase 2 outputs at {geom_dir}, skip"); return None
     cache = torch.load(cache_p, weights_only=False)
     train = cache["train"]
     ids = train["ids"][:32].to(device)
     mask = train["mask"][:32].to(device)
+    privacy = train.get("privacy_mask", train["mask"])[:32]
     clean = train["clean_a"][:32]
+    import json
+    meta_path = util.art_path(
+        "activations", model_id, task_name, f"split_{k}", "metadata.json",
+    )
+    if prefix_lens is None and meta_path.exists():
+        prefix_lens = tuple(
+            json.loads(meta_path.read_text()).get(
+                "privacy_positions", [2, 5, 10, 20],
+            )
+        )
+    if prefix_lens is None:
+        prefix_lens = (2, 5, 10, 20)
     H = clean.shape[-1]
     median_norm = float(clean.float().norm(dim=-1).median())
     print(f"  H={H}  median_norm={median_norm:.3f}", flush=True)
 
     model, _ = M.load_model(model_id, dtype=dtype, device=device)
-    Gp = estimate_g_priv(model, ids, k=k, attention_mask=mask)
+    Gp = estimate_g_priv(
+        model, ids, k=k, prefix_lens=prefix_lens,
+        attention_mask=mask, row_mask=privacy,
+    )
     U_T = torch.load(geom_dir / "U_T.pt", weights_only=True)
     Gu = (U_T.float() @ U_T.float().T)
 
@@ -92,7 +112,9 @@ def run_one(model_id, k, device="cuda:0", dtype=torch.float32,
         "G_util_trace": float(Gu.diag().sum()),
     })
 
-    cov_dir = util.ART / "covariances" / safe / "sst2" / f"split_{k}"
+    cov_dir = util.art_path(
+        "covariances", model_id, task_name, f"split_{k}",
+    )
     cov_dir.mkdir(parents=True, exist_ok=True)
     summaries = []
     for sf in sigma0_fracs:
@@ -117,6 +139,38 @@ def run_one(model_id, k, device="cuda:0", dtype=torch.float32,
     return {"model_id": model_id, "k": k, "median_norm": median_norm, "n_cov": len(summaries)}
 
 
+def _write_covariance_reports(task_name: str, rows: list[dict]) -> None:
+    """Write one covariance report per model.
+
+    Args:
+        task_name: Benchmark name.
+        rows: Summaries returned by ``run_one``.
+    """
+    models = []
+    for row in rows:
+        if row["model_id"] not in models:
+            models.append(row["model_id"])
+    for model_id in models:
+        model_rows = [row for row in rows if row["model_id"] == model_id]
+        report = [
+            f"# Phase 3-4 {task_name} Geometry & Covariance",
+            "",
+            "| model | k | median norm | # cov files |",
+            "|---|---:|---:|---:|",
+        ]
+        for row in model_rows:
+            report.append(
+                f"| {row['model_id']} | {row['k']} | "
+                f"{row['median_norm']:.2f} | {row['n_cov']} |"
+            )
+        directory = util.art_path("reports", model_id, task_name)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "04_build_covariance.md").write_text("\n".join(report))
+        util.write_json(
+            directory / "covariance_summary.json", {"rows": model_rows},
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cuda:0")
@@ -128,6 +182,7 @@ def main():
     ap.add_argument("--ranks", nargs="+", type=int, default=[16])
     ap.add_argument("--sfs", nargs="+", type=float,
                     default=[0.5, 1.5, 3.0, 6.0, 10.0])
+    ap.add_argument("--task", default="sst2")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     seeding.set_seed(args.seed)
@@ -138,16 +193,12 @@ def main():
             r = run_one(
                 mid, k, dtype=M.default_dtype(mid, args.device),
                 device=args.device, sigma0_fracs=tuple(args.sfs),
-                ranks=tuple(args.ranks),
+                ranks=tuple(args.ranks), task_name=args.task,
             )
-            if r: rows.append(r)
-    util.write_json(util.ART / "covariance_summary.json", {"rows": rows})
-    rep = ["# Phase 3-4 SST-2 Geometry & Covariance", "",
-           "| model | k | median norm | # cov files |",
-           "|---|---:|---:|---:|"]
-    for r in rows:
-        rep.append(f"| {r['model_id']} | {r['k']} | {r['median_norm']:.2f} | {r['n_cov']} |")
-    (util.ART / "reports" / "04_build_covariance.md").write_text("\n".join(rep))
+            if r:
+                r["task"] = args.task
+                rows.append(r)
+    _write_covariance_reports(args.task, rows)
 
 
 if __name__ == "__main__":

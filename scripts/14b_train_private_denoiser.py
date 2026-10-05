@@ -32,18 +32,20 @@ def _no_grad():
 
 
 def model_safe(model_id: str) -> str:
-    return model_id.replace("/", "_")
+    return util.model_slug(model_id)
 
 
 def cache_path(model_id: str, task: str, k: int) -> Path:
-    return util.ART / "activations" / model_safe(model_id) / task / f"split_{k}" / "cache.pt"
+    return util.art_path(
+        "activations", model_id, task, f"split_{k}", "cache.pt",
+    )
 
 
 def cov_path(model_id: str, task: str, k: int, sigma0_frac: float, rank: int,
              family: str) -> Path:
-    return (
-        util.ART / "covariances" / model_safe(model_id) / task / f"split_{k}"
-        / f"sigma0_{sigma0_frac:g}_r{rank}__{family}.pt"
+    return util.art_path(
+        "covariances", model_id, task, f"split_{k}",
+        f"sigma0_{sigma0_frac:g}_r{rank}__{family}.pt",
     )
 
 
@@ -55,9 +57,9 @@ def private_suffix(family: str) -> str:
 
 def out_dir(model_id: str, task: str, k: int, sigma0_frac: float, rank: int,
             family: str) -> Path:
-    return (
-        util.ART / "private_denoisers" / model_safe(model_id) / task / f"split_{k}"
-        / f"sigma0_{sigma0_frac:g}_r{rank}__{private_suffix(family)}"
+    return util.art_path(
+        "private_denoisers", model_id, task, f"split_{k}",
+        f"sigma0_{sigma0_frac:g}_r{rank}__{private_suffix(family)}",
     )
 
 
@@ -241,6 +243,23 @@ def parse_args():
     return ap.parse_args()
 
 
+def _write_denoiser_summaries(rows: list[dict]) -> None:
+    """Write one suppressor summary per model and task.
+
+    Args:
+        rows: Metric dicts returned by ``train_one``.
+    """
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        key = (row["model_id"], row["task"])
+        groups.setdefault(key, []).append(row)
+    for (model_id, task), group in groups.items():
+        directory = util.art_path("reports", model_id, task)
+        util.write_json(
+            directory / "private_denoiser_summary.json", {"rows": group},
+        )
+
+
 def main():
     args = parse_args()
     _require_torch()
@@ -262,7 +281,7 @@ def main():
                         )
                         if row is not None:
                             rows.append(row)
-    util.write_json(util.ART / "private_denoiser_summary.json", {"rows": rows})
+    _write_denoiser_summaries(rows)
 
 
 if __name__ == "__main__":

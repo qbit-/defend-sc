@@ -50,6 +50,82 @@ class _Replace:
         return args, kwargs
 
 
+def splice_prompt_hidden(
+    hidden: torch.Tensor,
+    prompt_hidden: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Replace each row's prompt span and keep the other positions.
+
+    Args:
+        hidden: Cut activations for the full sequence, ``[B, T, H]``.
+        prompt_hidden: Left-padded prompt activations. Indexing matches
+            ``starts`` on the prompt width.
+        starts: Prompt start index in each row.
+        lengths: Number of real prompt tokens in each row.
+
+    Returns:
+        A clone of ``hidden`` with the prompt span overwritten.
+    """
+    spliced = hidden.clone()
+    prompt = prompt_hidden.to(device=hidden.device, dtype=hidden.dtype)
+    for row in range(hidden.shape[0]):
+        start = int(starts[row])
+        end = start + int(lengths[row])
+        spliced[row, start:end] = prompt[row, start:end]
+    return spliced
+
+
+class _SplicePrompt:
+    """Forward pre-hook that splices prompt activations into the cut."""
+
+    def __init__(
+        self,
+        prompt_hidden: torch.Tensor,
+        starts: torch.Tensor,
+        lengths: torch.Tensor,
+    ):
+        """Store the prompt span that the hook writes.
+
+        Args:
+            prompt_hidden: Left-padded prompt activations.
+            starts: Prompt start index in each row.
+            lengths: Real prompt lengths.
+        """
+        self.prompt_hidden = prompt_hidden
+        self.starts = starts
+        self.lengths = lengths
+
+    def hook(self, module, args, kwargs):
+        """Replace prompt positions in the incoming hidden state.
+
+        Args:
+            module: Hooked module. Unused.
+            args: Positional forward arguments.
+            kwargs: Keyword forward arguments.
+
+        Returns:
+            Updated args and kwargs for the module forward.
+        """
+        del module
+        if args and isinstance(args[0], torch.Tensor):
+            spliced = splice_prompt_hidden(
+                args[0], self.prompt_hidden, self.starts, self.lengths,
+            )
+            return (spliced,) + args[1:], kwargs
+        if "hidden_states" in kwargs:
+            kwargs = dict(kwargs)
+            kwargs["hidden_states"] = splice_prompt_hidden(
+                kwargs["hidden_states"],
+                self.prompt_hidden,
+                self.starts,
+                self.lengths,
+            )
+            return args, kwargs
+        return args, kwargs
+
+
 def _hook_target(model, k: int):
     """Return the module to hook to capture/replace the cut activation at depth k.
 
@@ -101,6 +177,53 @@ def split_run(model, input_ids, k: int, hidden_override=None,
     finally:
         for h in handles:
             h.remove()
+    return {
+        "a_k": cap_ak.hidden,
+        "server_out": cap_final.hidden,
+        "logits": out.logits,
+    }
+
+
+@torch.no_grad()
+def split_run_splice(
+    model,
+    input_ids: torch.Tensor,
+    k: int,
+    prompt_hidden: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> dict:
+    """Run the model, replacing only the prompt span at the cut.
+
+    Args:
+        model: Causal language model.
+        input_ids: Prompt plus any continuation tokens.
+        k: Split depth.
+        prompt_hidden: Left-padded prompt cut activations.
+        starts: Prompt start index in each row.
+        lengths: Real prompt lengths.
+        attention_mask: Mask for ``input_ids``.
+
+    Returns:
+        Dict with ``a_k``, ``server_out``, and ``logits``.
+    """
+    cap_ak = _Capture()
+    cap_final = _Capture()
+    target_k = _hook_target(model, k)
+    splice = _SplicePrompt(prompt_hidden, starts, lengths)
+    handles = [
+        target_k.register_forward_pre_hook(splice.hook, with_kwargs=True),
+        target_k.register_forward_pre_hook(cap_ak.hook, with_kwargs=True),
+        M.final_norm(model).register_forward_pre_hook(
+            cap_final.hook, with_kwargs=True,
+        ),
+    ]
+    try:
+        out = model(input_ids=input_ids, attention_mask=attention_mask)
+    finally:
+        for handle in handles:
+            handle.remove()
     return {
         "a_k": cap_ak.hidden,
         "server_out": cap_final.hidden,

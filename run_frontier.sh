@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Reproduce the one-shot privacy/utility frontier for the lowrank_struct
-# server-private suppressor on SST-2 (split k=8, rank 8).
+# server-private suppressor (split k=8, rank 8).
 #
 #   MODEL=Qwen/Qwen2.5-0.5B ./run_frontier.sh
-#   MODEL=Qwen/Qwen3.5-4B  ./run_frontier.sh
+#   MODEL=Qwen/Qwen3.5-4B TASK=word_sorting ./run_frontier.sh
 #
 # Requires a GPU and the project env (PyTorch, transformers>=5.5).
 # Uses .venv/bin/python when PY is unset and that interpreter exists.
@@ -17,13 +17,18 @@ else
 fi
 DEVICE="${DEVICE:-cuda:0}"
 MODEL="${MODEL:-Qwen/Qwen2.5-0.5B}"
+TASK="${TASK:-sst2}"
 K="${K:-8}"
 RANK="${RANK:-8}"
 SEED="${SEED:-0}"
 SFS="0.01 0.02 0.03 0.04 0.05 0.075 0.1 0.125 0.15 0.2 0.25 0.3 0.35 0.4 0.5 0.75 1.0 1.25 1.5 3.0 6.0 10.0"
-SAFE_MODEL="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/_/g')"
-OUT_TAG="${SAFE_MODEL}_sst2_lowrank_private_suppressor"
-PREFIX="setting_g_${OUT_TAG}"
+SAFE_MODEL="${MODEL//\//_}"
+PREFIX="lowrank_private_suppressor"
+if [[ "$TASK" == "sst2" ]]; then
+    POSITION_ARGS=(--positions 2 5 8 10 12 15 18 20)
+else
+    POSITION_ARGS=()
+fi
 
 # Single reproducibility knob. SEED is passed to every stage, where
 # src/seeding.set_seed() seeds the global Python/NumPy/Torch/CUDA RNGs and pins
@@ -63,52 +68,46 @@ fi
 mkdir -p artifacts/reports artifacts/plots "$HF_HOME" "$HF_HUB_CACHE"
 
 echo "Model: $MODEL"
-echo "Outputs: artifacts/${PREFIX}/ and artifacts/plots/${PREFIX}_*.png"
+echo "Task: $TASK"
+echo "Outputs: artifacts/evals/${SAFE_MODEL}/${TASK}/ and artifacts/plots/${SAFE_MODEL}/${TASK}/"
 
 # 1. Cache clean + clipped cut activations, answer-position features, task head (LM-head rows).
-$PY scripts/01_collect_calibration.py --device "$DEVICE" --models "$MODEL" --ks $K --seed "$SEED"
+$PY scripts/01_collect_calibration.py --device "$DEVICE" --task "$TASK" --models "$MODEL" --ks $K --seed "$SEED"
 
 # 2. Phase-2 geometry: task subspace U_T + SIPIT-edge subspace U_S (writes geometry/.../U_T.pt).
-$PY scripts/02_subspace_alignment.py --device "$DEVICE" --models "$MODEL" --ks $K --seed "$SEED"
+$PY scripts/02_subspace_alignment.py --device "$DEVICE" --task "$TASK" --models "$MODEL" --ks $K --seed "$SEED"
 
 # 3. Build the rank-8 base covariance incl. the singular lowrank_struct subspace U_s.
 #    Only the base sf=0.5 is needed here; step 4 rescales it to the full sf menu.
-$PY scripts/04_build_covariance.py --device "$DEVICE" --models "$MODEL" --ks $K \
+$PY scripts/04_build_covariance.py --device "$DEVICE" --task "$TASK" --models "$MODEL" --ks $K \
     --ranks $RANK --sfs 0.5 --seed "$SEED"
 
 # 4. Re-scale the lowrank_struct covariance across the full sf menu (reuses U_s
 #    orientation). Note 12b's flags: --rank (singular) and --target-sfs.
-$PY scripts/12b_scale_lowrank_noise.py --models "$MODEL" --ks $K --rank $RANK \
+$PY scripts/12b_scale_lowrank_noise.py --task "$TASK" --models "$MODEL" --ks $K --rank $RANK \
     --families lowrank_struct --base-sf 0.5 --target-sfs $SFS --overwrite --seed "$SEED"
 
 # 5. Fit the server-private Wiener suppressor D_priv per sf (train split only).
-$PY scripts/14b_train_private_denoiser.py --task sst2 --models "$MODEL" --ks $K --ranks $RANK \
+$PY scripts/14b_train_private_denoiser.py --task "$TASK" --models "$MODEL" --ks $K --ranks $RANK \
     --families lowrank_struct --sfs $SFS --seed "$SEED"
 
 # 6. Evaluate utility (raw vs private) and Eve (vanilla / exact / seq-MAP) -> tnsc_eval.csv.
-$PY scripts/15_eval_tnsc.py --device "$DEVICE" --task sst2 --models "$MODEL" --ks $K --ranks $RANK \
+$PY scripts/15_eval_tnsc.py --device "$DEVICE" --task "$TASK" --models "$MODEL" --ks $K --ranks $RANK \
     --sfs $SFS \
     --variants clean_no_noise b1_lowrank_struct b1_lowrank_struct_private_suppressor \
     --K 2 --repeats 1 --n-attack-prompts 30 --attack-split test \
-    --positions 2 5 8 10 12 15 18 20 --seeds "$SEED" \
-    --out-tag "$OUT_TAG"
+    ${POSITION_ARGS+"${POSITION_ARGS[@]}"} --seeds "$SEED"
 
-# 7. Render the four plots, including the privacy/utility frontier.
+# 7. Render Eve plus one utility/frontier/gain figure per metric.
 $PY scripts/17_plot_lowrank_private_suppressor.py \
-    --csv "artifacts/${PREFIX}/tnsc_eval.csv" \
+    --csv "artifacts/evals/${SAFE_MODEL}/${TASK}/tnsc_eval.csv" \
     --prefix "$PREFIX"
 
 # 8. Time full inference against the split, noise, and suppressor.
 $PY scripts/18_measure_inference_slowdown.py \
-    --device "$DEVICE" --models "$MODEL" --split-k "$K" --rank "$RANK" \
-    --seed "$SEED" --prefix "${OUT_TAG}_inference_slowdown"
+    --device "$DEVICE" --task "$TASK" --models "$MODEL" --split-k "$K" --rank "$RANK" \
+    --seed "$SEED" --prefix "inference_slowdown"
 
 echo
-echo "Metrics: artifacts/${PREFIX}/tnsc_eval.csv"
-echo "Plots:"
-echo "  artifacts/plots/${PREFIX}_utility_vs_scale.png"
-echo "  artifacts/plots/${PREFIX}_eve_vs_scale.png"
-echo "  artifacts/plots/${PREFIX}_exact_privacy_utility_frontier.png"
-echo "  artifacts/plots/${PREFIX}_gain_and_clean_distortion.png"
-echo "  artifacts/plots/${OUT_TAG}_inference_slowdown_bar.png"
-echo "  artifacts/plots/${OUT_TAG}_inference_slowdown_noise_suppressor_times.png"
+echo "Metrics: artifacts/evals/${SAFE_MODEL}/${TASK}/tnsc_eval.csv"
+echo "Plots: artifacts/plots/${SAFE_MODEL}/${TASK}/"

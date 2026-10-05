@@ -8,18 +8,37 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src import models as M
-from src import split_model as SM
 from src import candidate_sets as CS
 from src import geometry as G
-from src import sst2_geometry as SG
-from src import sst2_data as D
 from src import util
 from src import seeding
+from src.tasks import get_task
+
+
+def _slice_optional(
+    split: dict, key: str, n_prompts: int, device: str,
+) -> torch.Tensor | None:
+    """Return the first rows of an optional tensor field.
+
+    Args:
+        split: Cached split dict.
+        key: Field name.
+        n_prompts: Row cap.
+        device: Destination device.
+
+    Returns:
+        Sliced tensor, or ``None`` when the field is absent.
+    """
+    value = split.get(key)
+    if value is None:
+        return None
+    return value[:n_prompts].to(device)
 
 
 @torch.no_grad()
 def per_prompt_local_S(model, ids, prefix_lens, k, n_top=80, n_rand=20,
-                       energy=0.9, max_rank=24, attention_mask=None):
+                       energy=0.9, max_rank=24, attention_mask=None,
+                       row_mask=None):
     """Vocabulary-wide candidate clouds at intermediate prefix positions, same as
     tame_sipit Phase 2 (S is the *prompt-recovery* subspace, not label-discriminative)."""
     out = []
@@ -36,6 +55,8 @@ def per_prompt_local_S(model, ids, prefix_lens, k, n_top=80, n_rand=20,
             k_split=k, chunk_size=M.cloud_chunk_size(model),
         )
         for b in range(cloud.shape[0]):
+            if row_mask is not None and not bool(row_mask[b, t]):
+                continue
             U, S, r = CS.local_subspace(cloud[b], energy=energy, max_rank=max_rank)
             if r > 0:
                 out.append((U.cpu(), float(S[0]), r, t))
@@ -68,11 +89,13 @@ def make_probe_directions(clean_a, n_dirs=64, seed=7):
 
 
 @torch.no_grad()
-def run_alignment(model_id, k, n_prompts=32, prefix_lens=(2, 5, 10, 20),
-                  n_probe=64, device="cuda:0", dtype=torch.float32):
-    print(f"\n--- alignment {model_id}  k={k} ---", flush=True)
-    safe = model_id.replace("/", "_")
-    cache_p = util.ART / "activations" / safe / "sst2" / f"split_{k}" / "cache.pt"
+def run_alignment(model_id, k, n_prompts=32, prefix_lens=None,
+                  n_probe=64, device="cuda:0", dtype=torch.float32,
+                  task_name="sst2"):
+    print(f"\n--- alignment {task_name} {model_id}  k={k} ---", flush=True)
+    cache_p = util.art_path(
+        "activations", model_id, task_name, f"split_{k}", "cache.pt",
+    )
     if not cache_p.exists():
         print(f"  skip: missing activation cache {cache_p}", flush=True)
         return None
@@ -82,10 +105,15 @@ def run_alignment(model_id, k, n_prompts=32, prefix_lens=(2, 5, 10, 20),
     mask = train["mask"][:n_prompts].to(device)
     ans_pos = train["ans_pos"][:n_prompts].to(device)
     clean = train["clean_a"][:n_prompts]
-    meta = util.ART / "activations" / safe / "sst2" / f"split_{k}" / "metadata.json"
+    privacy = train.get("privacy_mask", train["mask"])[:n_prompts]
+    meta = util.art_path(
+        "activations", model_id, task_name, f"split_{k}", "metadata.json",
+    )
     import json
     metadata = json.loads(meta.read_text())
-    label_token_ids = metadata["label_token_ids"]
+    label_token_ids = metadata.get("label_token_ids")
+    if prefix_lens is None:
+        prefix_lens = tuple(metadata.get("privacy_positions", [2, 5, 10, 20]))
 
     model, _ = M.load_model(model_id, dtype=dtype, device=device)
     L = M.n_layers(model)
@@ -94,25 +122,36 @@ def run_alignment(model_id, k, n_prompts=32, prefix_lens=(2, 5, 10, 20),
 
     local = per_prompt_local_S(model, ids, prefix_lens, k=k,
                                n_top=80, n_rand=20, energy=0.9, max_rank=24,
-                               attention_mask=mask)
+                               attention_mask=mask, row_mask=privacy)
     U_S, r_S = aggregate_subspace(local, max_rank=64, energy=0.9)
 
     probes = make_probe_directions(clean, n_dirs=n_probe, seed=7)
-    U_T, sigma_T, r_T = SG.label_logit_jacobian_subspace(
-        model, ids, mask, ans_pos, label_token_ids, k=k,
-        probe_dirs=probes, tau=1e-2, energy=0.9, max_rank=64,
+    batch = {
+        "input_ids": ids,
+        "attention_mask": mask,
+        "answer_pos": ans_pos,
+        "clean_a": clean.to(device),
+        "gold_ids": _slice_optional(train, "gold_ids", n_prompts, device),
+        "gold_mask": _slice_optional(train, "gold_mask", n_prompts, device),
+    }
+    task = get_task(task_name)
+    U_T, _sigma_t, r_T = task.estimate_task_subspace(
+        model, batch, probes, k, label_token_ids,
     )
 
     angles = G.principal_angles(U_S, U_T)
     mass = G.mass_T_perp_of_S(U_S, U_T)
     deg = (angles * 180.0 / 3.141592653589793).tolist()
 
-    out_dir = util.ART / "geometry" / safe / "sst2" / f"split_{k}"
+    out_dir = util.art_path(
+        "geometry", model_id, task_name, f"split_{k}",
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     torch.save(U_S.cpu(), out_dir / "U_S.pt")
     torch.save(U_T.cpu(), out_dir / "U_T.pt")
     summary = {
-        "model_id": model_id, "k": k, "n_prompts": int(ids.shape[0]),
+        "model_id": model_id, "task": task_name, "k": k,
+        "n_prompts": int(ids.shape[0]),
         "r_S": int(r_S), "r_T": int(r_T),
         "mass_T_perp_of_S": float(mass),
         "principal_angles_deg": deg[:10],
@@ -125,36 +164,67 @@ def run_alignment(model_id, k, n_prompts=32, prefix_lens=(2, 5, 10, 20),
     return summary
 
 
+def _write_alignment_reports(task_name: str, rows: list[dict]) -> None:
+    """Write one subspace-alignment report per model.
+
+    Args:
+        task_name: Benchmark name.
+        rows: Summaries returned by ``run_alignment``.
+    """
+    models = []
+    for row in rows:
+        if row["model_id"] not in models:
+            models.append(row["model_id"])
+    for model_id in models:
+        model_rows = [row for row in rows if row["model_id"] == model_id]
+        report = [
+            f"# Phase 2 {task_name} Subspace Alignment",
+            "",
+            "| model | k | r_S | r_T | mass_T_perp(S) | decision |",
+            "|---|---:|---:|---:|---:|:---:|",
+        ]
+        for row in model_rows:
+            report.append(
+                f"| {row['model_id']} | {row['k']} | {row['r_S']} | "
+                f"{row['r_T']} | {row['mass_T_perp_of_S']:.3f} | "
+                f"**{row['decision']}** |"
+            )
+        directory = util.art_path("reports", model_id, task_name)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "02_subspace_alignment.md").write_text(
+            "\n".join(report),
+        )
+        util.write_json(
+            directory / "subspace_alignment_summary.json",
+            {"rows": model_rows},
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--models", nargs="+", default=["gpt2", "Qwen/Qwen2.5-0.5B"])
     ap.add_argument("--ks", nargs="+", type=int, default=[0, 4, 8])
     ap.add_argument("--n_prompts", type=int, default=32)
-    ap.add_argument("--prefix-lens", nargs="+", type=int, default=[2, 5, 10, 20])
+    ap.add_argument("--prefix-lens", nargs="+", type=int, default=None)
     ap.add_argument("--n-probe", type=int, default=64)
+    ap.add_argument("--task", default="sst2")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     seeding.set_seed(args.seed)
+    prefix = None if args.prefix_lens is None else tuple(args.prefix_lens)
 
     rows = []
     for mid in args.models:
         dt = M.default_dtype(mid, args.device)
         for k in args.ks:
             r = run_alignment(mid, k, n_prompts=args.n_prompts,
-                              prefix_lens=tuple(args.prefix_lens),
-                              n_probe=args.n_probe, dtype=dt, device=args.device)
+                              prefix_lens=prefix,
+                              n_probe=args.n_probe, dtype=dt, device=args.device,
+                              task_name=args.task)
             if r: rows.append(r)
 
-    util.write_json(util.ART / "subspace_alignment_summary.json", {"rows": rows})
-    rep = ["# Phase 2 SST-2 Subspace Alignment", "",
-           "T_k built on answer-position label logits (2 classes).", "",
-           "| model | k | r_S | r_T | mass_T_perp(S) | decision |",
-           "|---|---:|---:|---:|---:|:---:|"]
-    for r in rows:
-        rep.append(f"| {r['model_id']} | {r['k']} | {r['r_S']} | {r['r_T']} "
-                   f"| {r['mass_T_perp_of_S']:.3f} | **{r['decision']}** |")
-    (util.ART / "reports" / "02_subspace_alignment.md").write_text("\n".join(rep))
+    _write_alignment_reports(args.task, rows)
 
 
 if __name__ == "__main__":

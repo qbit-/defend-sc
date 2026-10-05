@@ -27,13 +27,26 @@ from src import util
 from src import seeding
 
 
-def model_safe(model_id: str) -> str:
-    return model_id.replace("/", "_")
+def cov_path(
+    model_id: str, task: str, k: int, sf: float, rank: int, family: str,
+) -> Path:
+    """Return one covariance artifact path.
 
+    Args:
+        model_id: Hugging Face model id.
+        task: Benchmark name.
+        k: Split depth.
+        sf: Noise scale.
+        rank: Covariance rank.
+        family: Covariance family name.
 
-def cov_path(model_id: str, k: int, sf: float, rank: int, family: str) -> Path:
-    return (util.ART / "covariances" / model_safe(model_id) / "sst2"
-            / f"split_{k}" / f"sigma0_{sf:g}_r{rank}__{family}.pt")
+    Returns:
+        Path of the ``.pt`` covariance file.
+    """
+    return util.art_path(
+        "covariances", model_id, task, f"split_{k}",
+        f"sigma0_{sf:g}_r{rank}__{family}.pt",
+    )
 
 
 def scale_covariance_blob(blob: dict, family: str, base_sf: float,
@@ -65,6 +78,7 @@ def parse_args():
     ap.add_argument("--target-sfs", nargs="+", type=float,
                     default=[0.05, 0.1, 0.2, 0.35])
     ap.add_argument("--rank", type=int, default=16)
+    ap.add_argument("--task", default="sst2")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
@@ -78,7 +92,9 @@ def main():
     for model_id in args.models:
         for k in args.ks:
             for family in args.families:
-                src = cov_path(model_id, k, args.base_sf, args.rank, family)
+                src = cov_path(
+                    model_id, args.task, k, args.base_sf, args.rank, family,
+                )
                 if not src.exists():
                     raise FileNotFoundError(
                         f"missing base covariance {src}; run 04_build_covariance.py "
@@ -86,7 +102,9 @@ def main():
                     )
                 blob = torch.load(src, weights_only=True)
                 for sf in args.target_sfs:
-                    dst = cov_path(model_id, k, sf, args.rank, family)
+                    dst = cov_path(
+                        model_id, args.task, k, sf, args.rank, family,
+                    )
                     if dst.exists() and not args.overwrite:
                         print(f"skip existing {dst}")
                         continue
@@ -99,30 +117,7 @@ def main():
                         torch.save(scaled, dst)
                         print(f"wrote {dst}")
                     written.append(dst)
-
-    sf_args = " ".join(f"{sf:g}" for sf in args.target_sfs)
-    model_args = " ".join(args.models)
-    k_args = " ".join(str(k) for k in args.ks)
-    family_args = " ".join(args.families)
-    print("\nNext commands:")
-    print(
-        "python "
-        "exps/split_sipit/sst2_logit/scripts/05_train_debiaser.py "
-        f"--models {model_args} --ks {k_args} --sfs {sf_args} "
-        f"--noise {family_args} --device cuda:0"
-    )
-    print(
-        "python "
-        "exps/split_sipit/sst2_logit/scripts/12_setting_b1_channel.py "
-        f"--models {model_args} --ks {k_args} --noise {family_args} "
-        f"--sfs {sf_args} --distributions gaussian "
-        "--repeats 1 4 --n_attack_prompts 24 "
-        "--out-tag qwen_lowrank_lownoise --device cuda:0"
-    )
-    print(
-        "# optional distribution sweep: replace `--distributions gaussian` with "
-        "`--distributions gaussian uniform laplace rademacher`"
-    )
+    print(f"scaled {len(written)} covariance files", flush=True)
 
 
 if __name__ == "__main__":

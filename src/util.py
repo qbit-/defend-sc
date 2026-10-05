@@ -6,6 +6,36 @@ ROOT = Path(__file__).resolve().parents[1]
 ART = ROOT / "artifacts"
 
 
+def model_slug(model_id: str) -> str:
+    """Return a filesystem slug for a Hugging Face model id.
+
+    Args:
+        model_id: Model id such as ``Qwen/Qwen2.5-0.5B``.
+
+    Returns:
+        ``model_id`` with ``/`` replaced by ``_``.
+    """
+    return model_id.replace("/", "_")
+
+
+def art_path(kind: str, model_id: str, task: str, *parts: str) -> Path:
+    """Return an artifact path grouped by model and benchmark.
+
+    Args:
+        kind: Top-level artifact folder, such as ``plots``.
+        model_id: Hugging Face model id.
+        task: Benchmark name, such as ``sst2``.
+        *parts: Extra path components under the task folder.
+
+    Returns:
+        ``artifacts/<kind>/<model>/<task>/...``.
+    """
+    path = ART / kind / model_slug(model_id) / task
+    for part in parts:
+        path = path / part
+    return path
+
+
 def run_id(tag: str) -> str:
     return f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{tag}"
 
