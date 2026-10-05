@@ -5,14 +5,15 @@ description = "Experimental code for securing activation channels and plotting p
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "accelerate>=0.26.0",
-    "datasets>=2.19.0,<3.0.0",
-    "huggingface-hub>=0.23.0",
+    "accelerate>=1.1.0",
+    "datasets>=4.0.0",
+    "huggingface-hub>=1.31.0,<2.0.0",
     "matplotlib>=3.8.0",
     "numpy>=1.26.0,<3.0.0",
+    "pyarrow>=21.0.0",
     "safetensors>=0.4.0",
-    "torch>=2.2.0",
-    "transformers>=5.5.0",
+    "torch>=2.5.0",
+    "transformers[torch]>=5.5.0",
 ]
 
 [build-system]

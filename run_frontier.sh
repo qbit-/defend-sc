@@ -6,10 +6,15 @@
 #   MODEL=Qwen/Qwen3.5-4B  ./run_frontier.sh
 #
 # Requires a GPU and the project env (PyTorch, transformers>=5.5).
-# Set PY to that interpreter.
+# Uses .venv/bin/python when PY is unset and that interpreter exists.
 set -euo pipefail
 
-PY="${PY:-python}"
+cd "$(dirname "$0")"
+if [[ -z "${PY:-}" && -x .venv/bin/python ]]; then
+    PY=".venv/bin/python"
+else
+    PY="${PY:-python}"
+fi
 DEVICE="${DEVICE:-cuda:0}"
 MODEL="${MODEL:-Qwen/Qwen2.5-0.5B}"
 K="${K:-8}"
@@ -27,8 +32,6 @@ PREFIX="setting_g_${OUT_TAG}"
 # for all stages. Set DEFEND_SC_STRICT_DETERMINISM=1 to additionally request
 # deterministic CUDA kernels (slower; warns rather than fails on unsupported ops).
 export PYTHONHASHSEED="$SEED"
-
-cd "$(dirname "$0")"
 
 # Keep Hugging Face downloads in a writable project-local cache unless the user
 # has already configured a writable cache location.
