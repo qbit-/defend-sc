@@ -5,11 +5,12 @@ import json
 import random
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import torch
 
 from src import util
-from src.tasks.privacy import positions_from_mask
+from src.tasks.privacy import resolve_task_positions
 
 
 def few_shot_exemplars() -> tuple[tuple[str, str], ...]:
@@ -347,6 +348,8 @@ class WordSortingTask:
         self.max_len = 256
         self.max_new_tokens = 64
         self.privacy_offsets = (0, 1, 2, 3, 5, 8, 12, 16)
+        self.offset_pattern = ""
+        self.privacy_from_mask = True
 
     def load_split(
         self, split: str, n: int | None, seed: int,
@@ -417,18 +420,22 @@ class WordSortingTask:
             "gold_mask": gold_mask,
         }
 
-    def resolve_privacy_positions(self, encoded: dict) -> list[int]:
-        """Return attack positions inside the query word list.
+    def resolve_privacy_positions(
+        self, encoded: dict, tokenizer: Any = None,
+    ) -> list[int]:
+        """Return the configured attack positions for this batch.
 
         Args:
             encoded: Batch from ``encode``, including ``privacy_mask``.
+            tokenizer: Required when ``offset_pattern`` is set.
 
         Returns:
-            Absolute token positions.
+            Absolute token positions the attack should score.
         """
-        return positions_from_mask(
-            encoded["privacy_mask"], self.privacy_offsets,
+        positions, _score = resolve_task_positions(
+            self, encoded, tokenizer,
         )
+        return positions
 
     def estimate_task_subspace(
         self,

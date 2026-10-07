@@ -22,6 +22,11 @@ from src import seeding
 from src.attacks import exact_dist as ED
 from src.attacks import sipit as SIP
 from src.tasks import get_task
+from src.tasks.privacy import (
+    add_privacy_arguments,
+    configure_privacy,
+    resolve_task_positions,
+)
 from src.tasks.generation_eval import score_generation
 
 
@@ -761,6 +766,7 @@ def attack_metrics(
     attack_split: str = "test",
     task: str = "sst2",
     independent_recovery: bool = True,
+    score_mask: torch.Tensor | None = None,
 ) -> list[dict]:
     """Score Eve from the true prefix or from each attacker's guesses.
 
@@ -779,15 +785,15 @@ def attack_metrics(
         attack_split: ``train`` or ``test``.
         task: Benchmark name.
         independent_recovery: Keep the true prefix when true.
+        score_mask: Rows and positions Eve may score. ``None``
+            keeps the stored privacy mask.
 
     Returns:
         Metric rows for the clean run or each noisy policy.
     """
     attack_cache = cache[attack_split]
     ids = attack_cache["ids"][:n_attack_prompts]
-    mask = attack_cache.get(
-        "privacy_mask", attack_cache["mask"],
-    )[:n_attack_prompts]
+    mask = _score_mask(attack_cache, score_mask, n_attack_prompts)
     clipped = attack_cache["clipped_a"][:n_attack_prompts]
     clouds = _attack_clouds(
         model, model_id, k, ids, positions, device, task,
@@ -889,7 +895,7 @@ def parse_args():
     ap.add_argument("--n-attack-prompts", type=int, default=8)
     ap.add_argument("--attack-split", default="test", choices=["train", "test"],
                     help="cache split used for Eve/SIPIT attack metrics")
-    ap.add_argument("--positions", nargs="+", type=int, default=None)
+    add_privacy_arguments(ap)
     ap.add_argument(
         "--independent_recovery",
         type=_parse_bool,
@@ -907,27 +913,56 @@ def parse_args():
     return ap.parse_args()
 
 
-def _attack_positions(task, cache: dict, split: str, override) -> tuple[int, ...]:
-    """Return Eve positions, from the CLI or the task privacy span.
+def _score_mask(
+    split_cache: dict,
+    score_mask: torch.Tensor | None,
+    n_prompts: int,
+) -> torch.Tensor:
+    """Return the rows Eve is allowed to score.
 
     Args:
-        task: Benchmark object.
-        cache: Activation cache.
-        split: ``train`` or ``test``.
-        override: Explicit positions, or ``None``.
+        split_cache: One cache split.
+        score_mask: Explicit mask, or ``None`` to use the stored one.
+        n_prompts: Leading rows to keep.
 
     Returns:
-        Positions passed to the SIPIT scorer.
+        Mask of shape ``[n_prompts, T]``.
     """
-    if override:
-        return tuple(int(position) for position in override)
+    if score_mask is None:
+        chosen = split_cache.get("privacy_mask", split_cache["mask"])
+    else:
+        chosen = score_mask
+    return chosen[:n_prompts]
+
+
+def _attack_sites(
+    task: Any,
+    cache: dict,
+    split: str,
+    tokenizer: Any,
+) -> tuple[tuple[int, ...], torch.Tensor | None]:
+    """Return Eve positions and the mask that selects them.
+
+    Args:
+        task: Benchmark object. Its privacy offsets are already set.
+        cache: Activation cache.
+        split: ``train`` or ``test``.
+        tokenizer: Required when the task has an offset pattern.
+
+    Returns:
+        Positions for the SIPIT scorer, and a score mask or ``None``.
+    """
+    block = cache[split]
+    attention = block["mask"]
     encoded = {
-        "input_ids": cache[split]["ids"],
-        "privacy_mask": cache[split].get(
-            "privacy_mask", cache[split]["mask"],
-        ),
+        "input_ids": block["ids"],
+        "attention_mask": attention,
+        "privacy_mask": block.get("privacy_mask", attention),
     }
-    return tuple(task.resolve_privacy_positions(encoded))
+    positions, score_mask = resolve_task_positions(
+        task, encoded, tokenizer,
+    )
+    return tuple(positions), score_mask
 
 
 def _metric_names(task) -> tuple[str, ...]:
@@ -1031,6 +1066,7 @@ def main():
     # global state from the primary seed so the whole eval is reproducible.
     seeding.set_seed(args.seeds[0])
     task = get_task(args.task)
+    configure_privacy(task, args.positions, args.offset_pattern)
     run_meta = util.base_meta(
         Path(__file__).name,
         task=args.task,
@@ -1042,6 +1078,7 @@ def main():
         n_attack_prompts=args.n_attack_prompts,
         attack_split=args.attack_split,
         positions=args.positions,
+        offset_pattern=args.offset_pattern,
         independent_recovery=args.independent_recovery,
         seeds=args.seeds,
         K=args.K,
@@ -1055,6 +1092,7 @@ def main():
     for model_id in args.models:
         dtype = M.default_dtype(model_id, args.device)
         model = None
+        tokenizer = None
         for k in args.ks:
             cpath = cache_path(model_id, k, task=args.task)
             tw_path = task_weights_path(model_id, k, task=args.task)
@@ -1089,8 +1127,12 @@ def main():
             meta_path = metadata_path(model_id, k, task=args.task)
             if meta_path.exists() and task.kind == "classification":
                 label_token_ids = json.loads(meta_path.read_text()).get("label_token_ids")
-            positions = _attack_positions(
-                task, cache, args.attack_split, args.positions,
+            if task.offset_pattern and tokenizer is None:
+                model, tokenizer = M.load_model(
+                    model_id, dtype=dtype, device=args.device,
+                )
+            positions, score_mask = _attack_sites(
+                task, cache, args.attack_split, tokenizer,
             )
             if model is None:
                 model, tokenizer = M.load_model(
@@ -1174,6 +1216,7 @@ def main():
                                 independent_recovery=(
                                     args.independent_recovery
                                 ),
+                                score_mask=score_mask,
                             )
                             for arow in attack_rows:
                                 row = {

@@ -1,10 +1,13 @@
 """SST-2 classification task adapter."""
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from src import sst2_data as data
 from src import sst2_geometry as geometry
+from src.tasks.privacy import resolve_task_positions
 
 
 class SST2Task:
@@ -17,7 +20,9 @@ class SST2Task:
         self.utility_metrics = ("accuracy",)
         self.max_len = 64
         self.max_new_tokens = 0
-        self.privacy_positions = (2, 5, 10, 20)
+        self.privacy_offsets = (2, 5, 10, 20)
+        self.offset_pattern = ""
+        self.privacy_from_mask = False
 
     def load_split(
         self, split: str, n: int | None, seed: int,
@@ -105,20 +110,22 @@ class SST2Task:
         """
         return data.gather_answer_position(hidden, answer_pos)
 
-    def resolve_privacy_positions(self, encoded: dict) -> list[int]:
-        """Return the fixed SST-2 attack positions that fit the batch.
+    def resolve_privacy_positions(
+        self, encoded: dict, tokenizer: Any = None,
+    ) -> list[int]:
+        """Return the configured attack positions for this batch.
 
         Args:
             encoded: Batch from ``encode``.
+            tokenizer: Required when ``offset_pattern`` is set.
 
         Returns:
-            Positions strictly inside the encoded width.
+            Absolute token positions the attack should score.
         """
-        width = int(encoded["input_ids"].shape[1])
-        return [
-            position for position in self.privacy_positions
-            if 0 < position < width
-        ]
+        positions, _score = resolve_task_positions(
+            self, encoded, tokenizer,
+        )
+        return positions
 
     def estimate_task_subspace(
         self,

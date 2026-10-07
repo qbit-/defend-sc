@@ -12,6 +12,7 @@ from src import split_model as SM
 from src import util
 from src import seeding
 from src.tasks import get_task
+from src.tasks.privacy import add_privacy_arguments, configure_privacy
 
 
 def activation_norm_quantile(
@@ -267,8 +268,9 @@ def collect_generation(
     )
     positions = task.resolve_privacy_positions({
         "input_ids": train["input_ids"],
+        "attention_mask": train["attention_mask"],
         "privacy_mask": train["privacy_mask"],
-    })
+    }, tokenizer)
     diag = _save_generation(
         task, model_id, k, max_len, hidden, n_layers, n_train, n_test,
         clip_quantile, train, test, threshold, diag_train, diag_test,
@@ -287,8 +289,11 @@ def collect_generation(
 @torch.no_grad()
 def collect_one(model_id, k, n_train=512, n_test=256, max_len=64,
                 dtype=torch.float32, device="cuda:0", clip_quantile=0.95,
-                batch_size=32, task_name="sst2", seed=0):
+                batch_size=32, task_name="sst2", seed=0,
+                attack_positions: list[int] | None = None,
+                offset_pattern: str = ""):
     task = get_task(task_name)
+    configure_privacy(task, attack_positions, offset_pattern)
     if task.kind == "generation":
         return collect_generation(
             task, model_id, k, n_train, n_test, max_len, dtype, device,
@@ -416,7 +421,12 @@ def collect_one(model_id, k, n_train=512, n_test=256, max_len=64,
 
     # Report
     positions = task.resolve_privacy_positions(
-        {"input_ids": train["ids"], "privacy_mask": train["mask"]},
+        {
+            "input_ids": train["ids"],
+            "attention_mask": train["mask"],
+            "privacy_mask": train["mask"],
+        },
+        tok,
     )
     diag = {
         "model_id": model_id, "k": k, "H": H, "n_layers": L,
@@ -484,6 +494,7 @@ def main():
     ap.add_argument("--clip-quantile", type=float, default=0.95)
     ap.add_argument("--batch-size", type=int, default=M.DEFAULT_BATCH)
     ap.add_argument("--seed", type=int, default=0)
+    add_privacy_arguments(ap)
     args = ap.parse_args()
     seeding.set_seed(args.seed)
     task = get_task(args.task)
@@ -497,7 +508,9 @@ def main():
                             max_len=max_len, dtype=dt, device=args.device,
                             clip_quantile=args.clip_quantile,
                             batch_size=args.batch_size,
-                            task_name=args.task, seed=args.seed)
+                            task_name=args.task, seed=args.seed,
+                            attack_positions=args.positions,
+                            offset_pattern=args.offset_pattern)
             if r: rows.append(r)
     _write_calibration_reports(args.task, rows)
 

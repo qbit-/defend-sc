@@ -60,10 +60,20 @@ export K=8
 export RANK=8
 export SFS="0.01 0.02 0.03 0.04 0.05 0.075 0.1 0.125 0.15 0.2 0.25 0.3 0.35 0.4 0.5 0.75 1.0 1.25 1.5 3.0 6.0 10.0"
 SAFE_MODEL="${MODEL//\//_}"
-if [[ "$TASK" == "sst2" ]]; then
-  POSITION_ARGS=(--positions 2 5 8 10 12 15 18 20)
-else
-  POSITION_ARGS=()
+# Empty OFFSET_PATTERN: POSITIONS are absolute token indices.
+# A pattern counts those offsets after its last match.
+if [[ -z "${POSITIONS+x}" && -z "${OFFSET_PATTERN+x}" && "$TASK" == "sst2" ]]; then
+  POSITIONS="2 5 8 10 12 15 18 20"
+fi
+POSITIONS="${POSITIONS:-}"
+OFFSET_PATTERN="${OFFSET_PATTERN:-}"
+POSITION_ARGS=()
+if [[ -n "$POSITIONS" ]]; then
+  # shellcheck disable=SC2086
+  POSITION_ARGS+=(--positions $POSITIONS)
+fi
+if [[ -n "$OFFSET_PATTERN" ]]; then
+  POSITION_ARGS+=(--offset_pattern "$OFFSET_PATTERN")
 fi
 
 $PY scripts/01_collect_calibration.py --device "$DEVICE" --task "$TASK" --models "$MODEL" --ks $K --seed "$SEED"
