@@ -189,6 +189,8 @@ def _plot_utility(
 
 def _plot_frontier(
     sfs, raw, raw_y, private_y, clean, limits, label, plot_dir, prefix, metric,
+    *, attack_column, attack_label, title_attack, filename_stem, x_limits,
+    annotation_offsets,
 ):
     """Write utility against Eve recovery.
 
@@ -203,37 +205,51 @@ def _plot_frontier(
         plot_dir: Figure directory.
         prefix: Filename prefix.
         metric: Metric id used in the filename.
+        attack_column: CSV column used for the horizontal axis.
+        attack_label: Human-readable horizontal-axis label.
+        title_attack: Attacker name shown in the title.
+        filename_stem: Figure filename component before the metric.
+        x_limits: Horizontal-axis limits, or ``None`` to choose from the data.
+        annotation_offsets: Noise scales and their annotation offsets.
 
     Returns:
         Written PNG path.
     """
     fig, ax = plt.subplots(figsize=(7.5, 5.2))
-    exact = [fnum(row, "eve_raw_exact") for row in raw]
-    ax.plot(exact, raw_y, "o-", label="raw lowrank_struct utility", alpha=0.5)
+    attack_scores = [fnum(row, attack_column) for row in raw]
     ax.plot(
-        exact, private_y, "s-",
+        attack_scores, raw_y, "o-",
+        label="raw lowrank_struct utility", alpha=0.5,
+    )
+    ax.plot(
+        attack_scores, private_y, "s-",
         label="server-private suppressed utility", alpha=0.5,
     )
-    marked_scales = (0.1, 0.25, 0.5, 1.0, 1.5, 3.0, 10.0)
-    for x_value, y_value, sf in zip(exact, private_y, sfs):
-        if sf in marked_scales and y_value is not None:
+    for x_value, y_value, sf in zip(attack_scores, private_y, sfs):
+        if sf in annotation_offsets and y_value is not None:
             ax.annotate(
                 f"{sf:g}", (x_value, y_value),
-                textcoords="offset points", xytext=(4, 4), fontsize=8,
+                textcoords="offset points",
+                xytext=annotation_offsets[sf],
+                fontsize=8,
             )
     if clean is not None:
         ax.axhline(
             clean, color="0.25", linestyle=":", linewidth=1.4,
             label=f"clean baseline ({clean:.3f})",
         )
-    ax.set_xlabel("exact Eve token top-1, m=1")
+    ax.set_xlabel(f"{attack_label} Eve token top-1, m=1")
     ax.set_ylabel(label)
-    ax.set_title(f"Privacy / Utility Frontier ({label})")
+    ax.set_title(f"Privacy / Utility Frontier, {title_attack} ({label})")
     ax.set_ylim(*limits)
-    ax.set_xlim(-0.03, 1.03)
+    if x_limits is None:
+        present_scores = [score for score in attack_scores if score is not None]
+        lower = -0.03 if present_scores and min(present_scores) < 0.2 else 0.2
+        x_limits = (lower, 1.03)
+    ax.set_xlim(*x_limits)
     ax.grid(True, alpha=0.25)
     ax.legend(fontsize=9)
-    return save(fig, plot_dir, prefix, f"frontier_{metric}")
+    return save(fig, plot_dir, prefix, f"{filename_stem}_{metric}")
 
 
 def _plot_gain(sfs, raw_y, private_y, private, label, plot_dir, prefix, metric):
@@ -266,18 +282,22 @@ def _plot_gain(sfs, raw_y, private_y, private, label, plot_dir, prefix, metric):
     ax1.set_xlabel("noise scale sf")
     ax1.set_ylabel(f"private {label} - raw {label}")
     ax1.grid(True, alpha=0.25)
-    ax2 = ax1.twinx()
-    ax2.plot(
-        sfs, distortion, "s--", color="#d62728",
-        label="clean distortion", alpha=0.65,
-    )
-    ax2.set_ylabel("clean activation distortion")
     lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(
-        lines1 + lines2, labels1 + labels2, fontsize=9, loc="upper left",
-    )
-    ax1.set_title(f"Suppressor Gain vs Clean Distortion ({label})")
+    if any(value is not None for value in distortion):
+        ax2 = ax1.twinx()
+        ax2.plot(
+            sfs, distortion, "s--", color="#d62728",
+            label="clean distortion", alpha=0.65,
+        )
+        ax2.set_ylabel("clean activation distortion")
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        lines1 += lines2
+        labels1 += labels2
+        title = f"Suppressor Gain vs Clean Distortion ({label})"
+    else:
+        title = f"Suppressor Gain ({label})"
+    ax1.legend(lines1, labels1, fontsize=9, loc="upper left")
+    ax1.set_title(title)
     return save(fig, plot_dir, prefix, f"gain_{metric}")
 
 
@@ -312,6 +332,35 @@ def plot_metric(
         _plot_frontier(
             sfs, raw, raw_y, private_y, clean, limits, label,
             plot_dir, prefix, metric,
+            attack_column="eve_raw_exact",
+            attack_label="exact/Mahalanobis",
+            title_attack="exact/Mahalanobis",
+            filename_stem="frontier",
+            x_limits=(-0.03, 1.03),
+            annotation_offsets={
+                0.1: (4, 4),
+                0.25: (4, 4),
+                0.5: (4, 4),
+                1.0: (4, 4),
+                1.5: (4, 4),
+                3.0: (4, 4),
+                10.0: (4, 4),
+            },
+        ),
+        _plot_frontier(
+            sfs, raw, raw_y, private_y, clean, limits, label,
+            plot_dir, prefix, metric,
+            attack_column="eve_seq_map",
+            attack_label="seq-MAP",
+            title_attack="seq-MAP",
+            filename_stem="frontier_seq_map",
+            x_limits=None,
+            annotation_offsets={
+                0.1: (5, 8),
+                0.25: (-32, 8),
+                1.0: (-28, -15),
+                10.0: (5, -18),
+            },
         ),
         _plot_gain(
             sfs, raw_y, private_y, private, label, plot_dir, prefix, metric,
